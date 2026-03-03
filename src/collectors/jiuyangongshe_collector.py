@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import platform
 import re
 import time
 import logging
@@ -28,24 +29,52 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://www.jiuyangongshe.com"
 USER_ID = "4df747be1bf143a998171ef03559b517"
 USER_PAGE_URL = f"{BASE_URL}/u/{USER_ID}"
-EDGE_PATH = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PROFILE_DIR = str((PROJECT_ROOT / ".cache" / "edge_jygs").resolve())
 USER_ID_PRESET = {
     "盘前纪要": USER_ID,
 }
 
+# -- 平台自适应浏览器路径 --
+_IS_WINDOWS = platform.system() == "Windows"
+# Windows 本地用 Edge
+EDGE_PATH = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+
+
+def _find_browser_path() -> str:
+    """自动检测浏览器路径：Windows 用 Edge，Linux/Cloud 用 Chromium。"""
+    if _IS_WINDOWS:
+        return EDGE_PATH
+    # Linux (Streamlit Cloud) — 查找 chromium 或 google-chrome
+    import shutil
+    for candidate in ["chromium-browser", "chromium", "google-chrome", "google-chrome-stable"]:
+        found = shutil.which(candidate)
+        if found:
+            logger.info("Linux 环境检测到浏览器: %s -> %s", candidate, found)
+            return found
+    # Streamlit Cloud 通过 packages.txt 安装的默认路径
+    for fallback in ["/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome"]:
+        if Path(fallback).exists():
+            logger.info("Linux 环境使用回退路径: %s", fallback)
+            return fallback
+    logger.warning("未找到可用浏览器，将尝试默认路径 /usr/bin/chromium")
+    return "/usr/bin/chromium"
+
 
 def _make_page():
-    """创建无头 Edge 浏览器页面。"""
+    """创建无头浏览器页面（自动适配 Windows/Linux）。"""
     from DrissionPage import ChromiumPage, ChromiumOptions
 
+    browser_path = _find_browser_path()
+    logger.info("使用浏览器: %s (平台: %s)", browser_path, platform.system())
+
     co = ChromiumOptions()
-    co.set_browser_path(EDGE_PATH)
+    co.set_browser_path(browser_path)
     co.headless()
     co.set_argument("--no-sandbox")
     co.set_argument("--disable-gpu")
     co.set_argument("--disable-blink-features=AutomationControlled")
+    co.set_argument("--disable-dev-shm-usage")  # 云端内存有限，避免 /dev/shm 溢出
     co.set_user_data_path(PROFILE_DIR)
     co.auto_port()
     return ChromiumPage(co)
