@@ -1095,7 +1095,11 @@ def run() -> None:
 
     result = st.session_state.get("ai_input_result")
     if result:
-        assert isinstance(result, AiInputExportResult)
+        if not isinstance(result, AiInputExportResult):
+            # 代码热更新后旧会话对象类型不匹配，清除并跳过
+            st.session_state.pop("ai_input_result", None)
+            result = None
+    if result:
         json_paths = getattr(result, "json_paths", None) or [result.json_path]
         md_paths = getattr(result, "md_paths", None) or [result.md_path]
         preview_path = result.json_path
