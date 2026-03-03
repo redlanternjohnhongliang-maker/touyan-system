@@ -13,11 +13,22 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.ui.ai_input_streamlit import run
 
 
-if __name__ == "__main__":
-    # 直接 python 启动时自动拉起 streamlit；若已在 streamlit 运行上下文中则直接执行页面函数
+def _is_running_under_streamlit() -> bool:
+    """判断当前是否在 Streamlit server 上下文中运行。"""
     if os.environ.get("STREAMLIT_SERVER_PORT"):
-        run()
-    else:
-        target = PROJECT_ROOT / "src" / "ui" / "ai_input_streamlit.py"
-        cmd = [sys.executable, "-m", "streamlit", "run", str(target)]
-        raise SystemExit(subprocess.call(cmd, cwd=str(PROJECT_ROOT)))
+        return True
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        return get_script_run_ctx() is not None
+    except Exception:
+        return False
+
+
+if _is_running_under_streamlit():
+    # Streamlit Cloud 或本地 streamlit run 时直接执行页面
+    run()
+elif __name__ == "__main__":
+    # 直接 python 启动时自动拉起 streamlit
+    target = PROJECT_ROOT / "src" / "ui" / "ai_input_streamlit.py"
+    cmd = [sys.executable, "-m", "streamlit", "run", str(target)]
+    raise SystemExit(subprocess.call(cmd, cwd=str(PROJECT_ROOT)))
