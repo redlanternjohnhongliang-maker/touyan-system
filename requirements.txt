@@ -6,3 +6,5 @@ lxml>=5.2.0
 python-dateutil>=2.9.0
 akshare>=1.13.0
 google-generativeai>=0.8.0
+streamlit-searchbox>=0.1.14
+DrissionPage>=4.0.0
