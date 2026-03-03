@@ -1,0 +1,47 @@
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.env
+
+# === 数据库 ===
+*.db
+*.sqlite
+*.sqlite3
+
+# === 根目录每日生成的研报产物（中文名 JSON/MD）===
+*_20??-??-??.json
+*_20??-??-??.md
+
+# === 每日缓存 ===
+_daily_reports_cache_*.json
+
+# === 测试/调试脚本 ===
+_test_*.py
+_debug_*.py
+
+# === tools 目录下的输出产物 ===
+tools/*.txt
+tools/*.json
+tools/*.md
+tools/ai_input_bundle_*.json
+tools/ai_input_bundle_*.md
+tools/explore_*.py
+tools/test_*.py
+tools/_debug_*.py
+tools/_test_*.py
+tools/tmp_*.json
+
+# === 归档目录（太大，不上传）===
+quant_archive/
+
+# === 数据目录（包含 CSV 缓存和 DB）===
+data/
+
+# === 其他 ===
+PROJECT_MEMORY.md
+*.bat
+prompts/
