@@ -688,6 +688,7 @@ def _run_dividend_calc(
         return
 
     st.session_state["dividend_yield_result"] = dy_result
+    st.session_state["_dy_last_symbol"] = symbol  # 记录本次计算的股票，用于换股检测
 
 
 def _render_dividend_result() -> None:
@@ -1085,6 +1086,7 @@ def run() -> None:
                     )
 
     if dy_btn:
+        st.session_state.pop("dividend_yield_result", None)  # 每次点击先清旧结果
         _run_dividend_calc(
             symbol=dy_symbol,
             query_date=dy_date,
