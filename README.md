@@ -392,6 +392,9 @@ python tools/backtest_dividend_sources_5y.py --symbol 600795
 
 ## 10. 变更记录
 
+### 2026-03-05
+- PDF 分割工具已独立为 `pdf分割器/` 项目（独立 Streamlit Web 应用），从本项目中移除
+
 ### 2026-02-27
 - 建立项目，创建可运行首版骨架
 - 接入九阳公社启发式抓取 + 东财多接口真实调用

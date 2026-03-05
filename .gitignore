@@ -44,4 +44,4 @@ data/
 # === 其他 ===
 PROJECT_MEMORY.md
 *.bat
-prompts/
+# prompts/ 不能忽略：云端导出需要读取 prompts/gemini_custom_instruction.md

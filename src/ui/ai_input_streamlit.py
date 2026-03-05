@@ -16,7 +16,6 @@ import streamlit as st
 import pandas as pd
 
 from streamlit_searchbox import st_searchbox
-import streamlit.components.v1 as _stc
 
 from src.services.ai_input_runner import PROJECT_ROOT, AiInputExportResult, run_ai_input_export
 from src.services.dividend_yield_service import calculate_dividend_yield
@@ -165,6 +164,26 @@ code, pre, .stCode {
   background: #fffbeb;
   color: var(--warn);
   border-radius: 6px;
+}
+
+@media (max-width: 768px) {
+    .hero {
+        padding: 14px 14px;
+        border-radius: 12px;
+    }
+    .hero h2 {
+        font-size: 1.05rem;
+    }
+    .hero p {
+        font-size: 0.9rem;
+    }
+    .panel {
+        padding: 10px 10px 2px 10px;
+        border-radius: 10px;
+    }
+    .card {
+        padding: 10px 10px;
+    }
 }
 </style>
         """,
@@ -428,54 +447,17 @@ def _search_stocks(query: str) -> list[str]:
     ]
 
 
-def _symbol_searchbox(label: str, key: str, placeholder: str) -> str:
+def _symbol_searchbox(label: str, key: str, placeholder: str, clear_on_submit: bool = True) -> str:
     """边输边弹候选下拉，点一下即选中，返回可被 resolve_stock_input 解析的字符串。"""
     selected = st_searchbox(
         _search_stocks,
         label=label,
         placeholder=placeholder,
         key=key,
-        clear_on_submit=True,
-        rerun_on_update=True,
+        clear_on_submit=clear_on_submit,
+        rerun_on_update=False,
         debounce=350,
     )
-    # 如果上次添加后需要自动聚焦搜索框，注入一段 JS
-    if st.session_state.pop("_auto_focus_search", False):
-        _stc.html(
-            """
-            <script>
-            (function() {
-                var attempts = 20;
-                function tryFocus() {
-                    var pd = window.parent.document;
-                    /* 方式1: 直接在主文档找 searchbox input */
-                    var el = pd.querySelector(
-                        '[data-testid="stSearchbox"] input[type="text"]'
-                    );
-                    if (el) { el.focus(); return; }
-                    /* 方式2: 遍历 iframe 找 combobox / autocomplete input */
-                    var iframes = pd.querySelectorAll('iframe');
-                    for (var i = 0; i < iframes.length; i++) {
-                        try {
-                            var doc = iframes[i].contentDocument
-                                   || iframes[i].contentWindow.document;
-                            if (!doc) continue;
-                            var inp = doc.querySelector(
-                                'input[role="combobox"],'
-                                + 'input[aria-autocomplete="list"],'
-                                + 'input[type="text"]'
-                            );
-                            if (inp) { inp.focus(); return; }
-                        } catch(e) {}
-                    }
-                    if (--attempts > 0) setTimeout(tryFocus, 200);
-                }
-                setTimeout(tryFocus, 400);
-            })();
-            </script>
-            """,
-            height=0,
-        )
     # selected 为 None（还在输入中）或已选中的字符串如 "600795  国电电力  (GDDL)"
     return str(selected or "").strip()
 
@@ -688,7 +670,6 @@ def _run_dividend_calc(
         return
 
     st.session_state["dividend_yield_result"] = dy_result
-    st.session_state["_dy_last_symbol"] = symbol  # 记录本次计算的股票，用于换股检测
 
 
 def _render_dividend_result() -> None:
@@ -910,12 +891,37 @@ def run() -> None:
     )
 
     default_out_dir = str(PROJECT_ROOT)
-    left, right = st.columns(2, gap="large")
-    with left:
+    tool_choice = st.radio(
+        "工具选择",
+        options=["信息合并导出", "股息率工具"],
+        horizontal=True,
+        key="tool_choice_top",
+    )
+
+    btn_reports = False
+    btn_stock = False
+    btn_all = False
+    dy_btn = False
+    symbol = ""
+    mode = "deep"
+    target_user = ""
+    target_date = date.today()
+    window_days = 1
+    allow_fallback = False
+    disable_weekend_shift = False
+    overwrite_latest = True
+    out_dir = default_out_dir
+    out_prefix = ""
+    dy_symbol = ""
+    dy_future_price_input = ""
+    dy_date = date.today()
+    dy_ttm_days = 365
+    dy_strict = False
+
+    if tool_choice == "信息合并导出":
         st.markdown('<div class="panel">', unsafe_allow_html=True)
         st.subheader("信息合并导出")
 
-        # ── 多股票输入区域 ──
         if "stock_list" not in st.session_state:
             st.session_state["stock_list"] = []
 
@@ -925,7 +931,6 @@ def run() -> None:
             placeholder="输入首字母/代码/中文名，选中后自动加入列表",
         )
 
-        # 选中即自动加入（用 session_state 记录上次处理的 symbol，避免每次 rerun 重复解析）
         if symbol.strip() and symbol != st.session_state.get("_last_resolved_symbol"):
             st.session_state["_last_resolved_symbol"] = symbol
             parsed = _resolve_symbol_for_ui(symbol, "加入股票")
@@ -935,15 +940,12 @@ def run() -> None:
                 existing_codes = {s["code"] for s in st.session_state["stock_list"]}
                 if code not in existing_codes:
                     st.session_state["stock_list"].append({"code": code, "name": name, "display": f"{code} {name}"})
-                    # 清空搜索框内部状态并设置自动聚焦标志
                     for _k in list(st.session_state.keys()):
                         if _k.startswith("fetch_symbol"):
                             del st.session_state[_k]
                     st.session_state["_last_resolved_symbol"] = ""
-                    st.session_state["_auto_focus_search"] = True
                     st.rerun()
 
-        # 显示已添加的股票列表
         if st.session_state["stock_list"]:
             st.caption(f"📋 待分析股票（{len(st.session_state['stock_list'])}只）：")
             _remove_code: str | None = None
@@ -983,14 +985,14 @@ def run() -> None:
         btn_stock = _btn_c2.button("② 个股数据", key="fetch_btn_stock", help="仅抓取个股接口数据，研报复用今日缓存")
         btn_all = _btn_c3.button("③ 全部下载", type="primary", key="fetch_btn_all", help="研报+要闻+个股一次性全部下载")
         st.markdown("</div>", unsafe_allow_html=True)
-
-    with right:
+    else:
         st.markdown('<div class="panel">', unsafe_allow_html=True)
         st.subheader("股息率工具")
         dy_symbol = _symbol_searchbox(
             label="股票代码或名称",
             key="dy_symbol",
             placeholder="输入首字母/代码/中文名，如 ynby / 000538 / 云南白药",
+            clear_on_submit=False,
         )
         dy_future_price_input = st.text_input(
             "输入价格(可选，留空=按日期模式)",
@@ -1086,7 +1088,6 @@ def run() -> None:
                     )
 
     if dy_btn:
-        st.session_state.pop("dividend_yield_result", None)  # 每次点击先清旧结果
         _run_dividend_calc(
             symbol=dy_symbol,
             query_date=dy_date,
@@ -1097,11 +1098,7 @@ def run() -> None:
 
     result = st.session_state.get("ai_input_result")
     if result:
-        if not isinstance(result, AiInputExportResult):
-            # 代码热更新后旧会话对象类型不匹配，清除并跳过
-            st.session_state.pop("ai_input_result", None)
-            result = None
-    if result:
+        assert isinstance(result, AiInputExportResult)
         json_paths = getattr(result, "json_paths", None) or [result.json_path]
         md_paths = getattr(result, "md_paths", None) or [result.md_path]
         preview_path = result.json_path
@@ -1117,8 +1114,12 @@ def run() -> None:
                 payload = result.payload
         meta = payload.get("meta", {})
         counts = _safe_counts(payload)
+        instruction = payload.get("llm_instruction", {}) if isinstance(payload, dict) else {}
 
         st.success("AI 输入文件已生成")
+        if not bool(instruction.get("attached")):
+            err_text = str(instruction.get("error", "")).strip()
+            st.warning(f"当前导出未附带提示词内容。{err_text}" if err_text else "当前导出未附带提示词内容。")
         latest_hint = "（当前为 latest 覆盖文件）" if "latest" in preview_path.name.lower() else ""
         path_lines: list[str] = []
         for p in json_paths:
@@ -1150,7 +1151,7 @@ def run() -> None:
         with t3:
             _render_diagnostics(payload)
     else:
-        st.info("在上方左侧“信息合并导出”填写参数后点击“生成并可视化”。")
+        st.info("在上方选择“信息合并导出”，填写参数后点击导出按钮。")
 
     st.divider()
     _render_dividend_result()
