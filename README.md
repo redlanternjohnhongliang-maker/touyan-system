@@ -1,3 +1,13 @@
+---
+title: 投研整合工作台
+emoji: 📈
+colorFrom: blue
+colorTo: indigo
+sdk: streamlit
+app_file: src/ui/ai_input_streamlit.py
+pinned: false
+---
+
 # 投研整合工作台
 
 > **定位**：本地运行的 AI 投研助手系统，自动抓取九阳公社（韭研公社）研报 + 东方财富多接口个股上下文，输出可直接喂给 AI 的原始输入包，并集成独立股息率多源交叉验证工具。
