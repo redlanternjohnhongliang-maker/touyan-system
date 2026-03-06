@@ -32,13 +32,13 @@ def _collect_output_paths(stdout: str | None) -> tuple[list[Path], list[Path]]:
     if not stdout:
         return json_paths, md_paths
     for line in (ln.strip() for ln in stdout.splitlines() if ln.strip()):
-        p = Path(line)
-        if not p.is_absolute():
-            p = (PROJECT_ROOT / p).resolve()
-        if p.suffix.lower() == ".json" and p.exists():
-            json_paths.append(p)
-        elif p.suffix.lower() == ".md" and p.exists():
-            md_paths.append(p)
+        path = Path(line)
+        if not path.is_absolute():
+            path = (PROJECT_ROOT / path).resolve()
+        if path.suffix.lower() == ".json" and path.exists():
+            json_paths.append(path)
+        elif path.suffix.lower() == ".md" and path.exists():
+            md_paths.append(path)
     return json_paths, md_paths
 
 
@@ -56,28 +56,27 @@ def _build_export_command(
     scope: str,
 ) -> list[str]:
     script_path = PROJECT_ROOT / "tools" / "export_merged_raw_content.py"
-    cmd = [
-        sys.executable,
-        str(script_path),
-    ]
+    cmd = [sys.executable, str(script_path)]
     if "," in resolved_symbols:
         cmd.extend(["--symbols", resolved_symbols])
     else:
         cmd.extend(["--symbol", resolved_symbols or "000000"])
-    cmd.extend([
-        "--mode",
-        mode.strip().lower(),
-        "--target-user",
-        target_user,
-        "--window-days",
-        str(max(1, int(window_days))),
-        "--out-prefix",
-        out_prefix,
-        "--out-dir",
-        out_dir,
-        "--scope",
-        scope,
-    ])
+    cmd.extend(
+        [
+            "--mode",
+            mode.strip().lower(),
+            "--target-user",
+            target_user,
+            "--window-days",
+            str(max(1, int(window_days))),
+            "--out-prefix",
+            out_prefix,
+            "--out-dir",
+            out_dir,
+            "--scope",
+            scope,
+        ]
+    )
     if target_date:
         cmd.extend(["--target-date", target_date])
     if allow_fallback:
@@ -101,11 +100,7 @@ def _push_event(event_queue: queue.Queue[str] | None, message: str) -> None:
         pass
 
 
-def _read_process_pipe(
-    pipe: Any,
-    sink: list[str],
-    event_queue: queue.Queue[str] | None,
-) -> None:
+def _read_process_pipe(pipe: Any, sink: list[str], event_queue: queue.Queue[str] | None) -> None:
     try:
         for raw_line in iter(pipe.readline, ""):
             line = str(raw_line).rstrip("\r\n")
@@ -134,7 +129,6 @@ def run_ai_input_export(
     timeout_sec: int = 420,
     event_queue: queue.Queue[str] | None = None,
 ) -> AiInputExportResult:
-    # 如果传了 symbols（多股票逗号分隔），优先使用
     if symbols.strip():
         resolved_symbols = symbols.strip()
     else:
@@ -157,9 +151,11 @@ def run_ai_input_export(
     )
 
     import os as _os
+
     env = _os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     _push_event(event_queue, "启动导出任务...")
+
     proc = subprocess.Popen(
         cmd,
         cwd=str(PROJECT_ROOT),
@@ -192,9 +188,9 @@ def run_ai_input_export(
         return_code = proc.wait(timeout=max(60, timeout_sec))
     except subprocess.TimeoutExpired as exc:
         proc.kill()
-        _push_event(event_queue, f"导出超时，已终止任务（>{max(60, timeout_sec)}s）")
+        _push_event(event_queue, f"export timeout (> {max(60, timeout_sec)}s)")
         raise RuntimeError(
-            "AI输入文件导出超时\n"
+            "AI input export timed out\n"
             f"cmd: {' '.join(cmd)}"
         ) from exc
     finally:
@@ -205,7 +201,7 @@ def run_ai_input_export(
     stderr = "\n".join(stderr_lines).strip()
     if return_code != 0:
         raise RuntimeError(
-            "AI输入文件导出失败\n"
+            "AI input export failed\n"
             f"cmd: {' '.join(cmd)}\n"
             f"stdout:\n{stdout}\n"
             f"stderr:\n{stderr}"
@@ -214,17 +210,16 @@ def run_ai_input_export(
     json_paths, md_paths = _collect_output_paths(stdout)
     if not json_paths or not md_paths:
         raise RuntimeError(
-            "导出脚本已执行但未识别到输出路径\n"
+            "Export finished but output paths were not detected\n"
             f"stdout:\n{stdout}\n"
             f"stderr:\n{stderr}"
         )
 
-    # 兼容旧调用：主文件取第一对
     json_path = json_paths[0]
-    md_lookup = {p.stem: p for p in md_paths}
+    md_lookup = {path.stem: path for path in md_paths}
     md_path = md_lookup.get(json_path.stem, md_paths[0])
 
-    payload = {}
+    payload: dict[str, Any] = {}
     markdown = ""
     try:
         import json

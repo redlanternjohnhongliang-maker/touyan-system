@@ -4,6 +4,7 @@ import calendar
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 import io
+import queue
 from pathlib import Path
 import json
 import os
@@ -15,9 +16,7 @@ from typing import Any
 import streamlit as st
 import pandas as pd
 
-from streamlit_searchbox import st_searchbox
-
-from src.services.ai_input_runner import PROJECT_ROOT, AiInputExportResult, run_ai_input_export
+from src.services.ai_input_runner_live import PROJECT_ROOT, AiInputExportResult, run_ai_input_export
 from src.services.dividend_yield_service import calculate_dividend_yield
 from src.services.symbol_resolver import resolve_stock_input, search_stock_suggestions, warmup_search_api
 
@@ -58,138 +57,371 @@ def _date_selector(label: str, default: date, key_prefix: str, disabled: bool = 
 
 
 def _inject_styles() -> None:
-    # 只在同一 session 首次加载时注入一次，后续 rerun 不重复注入 CSS 块
-    if st.session_state.get("_styles_injected_v3"):
-        return
-    st.session_state["_styles_injected_v3"] = True
+    # 搜索 API 预热只需执行一次
+    if not st.session_state.get("_warmup_started_v8"):
+        st.session_state["_warmup_started_v8"] = True
+        import threading
+        threading.Thread(target=warmup_search_api, daemon=True).start()
 
-    # 后台预热搜索 API 连接（DNS + TLS），消除首次输入卡顿
-    import threading
-    threading.Thread(target=warmup_search_api, daemon=True).start()
+    # 样式必须每次 rerun 都注入，因为 Streamlit 每次重建页面 DOM
     st.markdown(
         """
 <style>
-/* 使用系统字体，避免对境外 Google Fonts 发起网络请求（在国内极慢） */
 :root {
-  --bg-a: #f8fafc;
-  --bg-b: #eef2ff;
-  --card: #ffffff;
-  --text: #0f172a;
-  --muted: #475569;
-  --brand: #0f766e;
-  --brand-2: #0ea5a4;
-  --line: #dbe2ea;
-  --warn: #92400e;
+  --bg-0: #030815;
+  --bg-1: #071325;
+  --bg-2: #0c1d37;
+  --surface: rgba(7, 18, 36, 0.90);
+  --surface-2: rgba(10, 24, 48, 0.96);
+  --line: rgba(90, 220, 255, 0.28);
+  --line-strong: rgba(90, 220, 255, 0.46);
+  --text: #f5fbff;
+  --muted: #e3ecff;
+  --cyan: #5ce6ff;
+  --blue: #77a8ff;
+  --purple: #9b8cff;
+  --pink: #ff61dc;
+  --glow: 0 0 0 1px rgba(92, 230, 255, 0.18), 0 0 34px rgba(92, 230, 255, 0.14);
+  --shadow: 0 18px 60px rgba(0, 0, 0, 0.40);
 }
 
 html, body, [class*="css"] {
-  font-family: "Microsoft YaHei", "微软雅黑", "PingFang SC", "苹方-简", 微软雅黑, 宋体, sans-serif;
+  font-family: "Inter", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   color: var(--text);
 }
 
 [data-testid="stAppViewContainer"] {
-  background: linear-gradient(180deg, var(--bg-a), var(--bg-b));
+  background:
+    radial-gradient(circle at 12% 12%, rgba(92, 230, 255, 0.16), transparent 24%),
+    radial-gradient(circle at 88% 8%, rgba(155, 140, 255, 0.18), transparent 22%),
+    radial-gradient(circle at 50% 100%, rgba(255, 97, 220, 0.10), transparent 26%),
+    linear-gradient(135deg, var(--bg-0) 0%, var(--bg-1) 44%, var(--bg-2) 100%);
 }
 
-input,
-textarea {
-  color: #0f172a !important;
-  -webkit-text-fill-color: #0f172a !important;
-}
-input::placeholder,
-textarea::placeholder {
-  color: #64748b !important;
-  opacity: 1 !important;
+.block-container {
+  max-width: 1240px;
+  padding-top: 1.35rem;
+  padding-bottom: 2.8rem;
 }
 
-.panel {
-  background: rgba(255,255,255,0.92);
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  padding: 14px 14px 4px 14px;
+[data-testid="stHeader"] {
+  background: rgba(0,0,0,0);
+}
+
+[data-testid="stSidebar"] {
+  background: linear-gradient(180deg, rgba(6, 16, 30, 0.98), rgba(10, 24, 43, 0.96));
+  border-right: 1px solid var(--line);
+}
+
+[data-testid="stSidebar"] * {
+  color: var(--text) !important;
+}
+
+h1, h2, h3, label, p, li, span, div {
+  color: inherit;
+}
+
+label,
+[data-testid="stWidgetLabel"] p {
+  color: #ffffff !important;
+  font-weight: 700 !important;
+  font-size: 0.98rem !important;
+}
+
+h2 {
+  font-size: 1.26rem !important;
+  font-weight: 800 !important;
+  letter-spacing: -0.02em;
+}
+
+p, li, .stCaption, .stMarkdown, label {
+  line-height: 1.72;
+}
+
+small, .stCaption {
+  color: var(--muted) !important;
+  font-size: 0.92rem !important;
 }
 
 .hero {
-  background: linear-gradient(120deg, #0f766e, #0891b2);
-  border-radius: 14px;
-  padding: 18px 20px;
-  color: #f8fafc;
-  border: 1px solid rgba(255,255,255,0.2);
-  box-shadow: 0 4px 12px rgba(15, 118, 110, 0.18);
-  margin-bottom: 10px;
+  position: relative;
+  overflow: hidden;
+  background:
+    linear-gradient(135deg, rgba(9, 21, 40, 0.96), rgba(11, 30, 58, 0.90)),
+    linear-gradient(90deg, rgba(92, 230, 255, 0.10), rgba(155, 140, 255, 0.08));
+  border: 1px solid var(--line);
+  border-radius: 26px;
+  padding: 28px 30px 24px;
+  box-shadow: var(--shadow);
+  margin-bottom: 18px;
 }
-.hero h2 {
-  margin: 0 0 8px 0;
-  font-size: 1.25rem;
+
+.hero::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(circle at 0% 0%, rgba(92, 230, 255, 0.18), transparent 28%),
+    radial-gradient(circle at 100% 0%, rgba(155, 140, 255, 0.22), transparent 24%);
+  pointer-events: none;
+}
+
+.hero .eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: rgba(92, 230, 255, 0.14);
+  color: #c6f7ff;
+  font-size: 0.80rem;
   font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  box-shadow: 0 0 16px rgba(92, 230, 255, 0.12);
 }
+
+.hero h2 {
+  margin: 16px 0 0 0;
+  font-size: 2rem !important;
+  font-weight: 900 !important;
+  color: #ffffff;
+  text-shadow: 0 0 24px rgba(94, 160, 255, 0.18);
+}
+
 .hero p {
-  margin: 0;
-  opacity: 0.95;
+  margin: 12px 0 0 0;
+  max-width: 800px;
+  color: #e2eeff;
+  font-size: 1rem;
+}
+
+.hero-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.hero-badges span {
+  display: inline-flex;
+  align-items: center;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.08);
+  border: 1px solid rgba(255,255,255,0.16);
+  color: #ffffff;
+  font-size: 0.88rem;
+  font-weight: 700;
+  backdrop-filter: blur(8px);
+}
+
+.panel {
+  background: linear-gradient(180deg, rgba(7, 17, 32, 0.94), rgba(9, 22, 40, 0.90));
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  padding: 18px 18px 8px 18px;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(14px);
 }
 
 .card {
-  background: var(--card);
-  border-radius: 12px;
+  background: linear-gradient(180deg, rgba(12, 27, 50, 0.96), rgba(9, 18, 34, 0.94));
+  border-radius: 16px;
   border: 1px solid var(--line);
-  padding: 12px 14px;
+  padding: 14px 16px;
   margin: 8px 0;
+  box-shadow: var(--glow);
 }
+
 .card .k {
-  font-size: 12px;
-  color: var(--muted);
-  margin-bottom: 4px;
+  font-size: 0.82rem;
+  color: #d7e7ff;
+  margin-bottom: 6px;
 }
+
 .card .v {
-  font-size: 24px;
-  font-weight: 800;
-  color: var(--brand);
+  font-size: 1.82rem;
+  font-weight: 900;
+  color: #ffffff;
+}
+
+.path-box,
+[data-testid="stExpander"] {
+  background: rgba(8, 19, 36, 0.86);
+  border: 1px solid rgba(92, 230, 255, 0.18);
+  border-radius: 14px;
 }
 
 .path-box {
-  border: 1px dashed #94a3b8;
-  border-radius: 10px;
-  background: rgba(255,255,255,0.7);
-  padding: 10px 12px;
-  margin-top: 8px;
-}
-
-code, pre, .stCode {
-  font-family: "JetBrains Mono", "Cascadia Code", Consolas, 宋体, monospace !important;
+  padding: 12px 14px;
 }
 
 .warn-note {
-  border-left: 4px solid #f59e0b;
-  padding: 8px 10px;
-  background: #fffbeb;
-  color: var(--warn);
-  border-radius: 6px;
+  border-left: 4px solid var(--pink);
+  padding: 10px 12px;
+  background: rgba(255, 97, 220, 0.10);
+  color: #ffe3fa;
+  border-radius: 8px;
+}
+
+[data-testid="stRadio"] > div {
+  gap: 12px;
+}
+
+[data-testid="stRadio"] label {
+  background: rgba(255,255,255,0.12);
+  border: 1px solid rgba(255,255,255,0.24);
+  border-radius: 999px;
+  padding: 8px 14px;
+}
+
+[data-testid="stRadio"] label * {
+  color: #ffffff !important;
+}
+
+button[data-baseweb="tab"] {
+  height: 44px;
+  border-radius: 999px;
+  padding: 0 16px;
+  background: rgba(255,255,255,0.08);
+  border: 1px solid rgba(255,255,255,0.14);
+}
+
+button[data-baseweb="tab"] p {
+  color: #eef6ff !important;
+  font-size: 0.94rem;
+  font-weight: 800;
+}
+
+button[data-baseweb="tab"][aria-selected="true"] {
+  background: linear-gradient(90deg, rgba(92, 230, 255, 0.28), rgba(155, 140, 255, 0.28));
+  border-color: var(--line-strong);
+  box-shadow: 0 0 18px rgba(92, 230, 255, 0.18);
+}
+
+.stButton > button,
+.stDownloadButton > button {
+  border-radius: 14px;
+  border: 1px solid rgba(116, 232, 255, 0.42);
+  min-height: 44px;
+  height: auto;
+  padding: 0.58rem 0.95rem;
+  font-weight: 800;
+  font-size: 0.98rem;
+  color: #ffffff;
+  background: linear-gradient(180deg, rgba(25, 53, 92, 0.98), rgba(8, 20, 40, 0.99));
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.26);
+}
+
+.stButton > button:hover,
+.stDownloadButton > button:hover {
+  border-color: rgba(116, 232, 255, 0.72);
+  box-shadow: 0 0 22px rgba(92, 230, 255, 0.24);
+}
+
+.stButton > button[kind="primary"] {
+  background: linear-gradient(90deg, rgba(92, 230, 255, 0.98), rgba(119, 168, 255, 0.98));
+  color: #05101f;
+  border: none;
+}
+
+[data-testid="stTextInput"] input,
+[data-testid="stNumberInput"] input,
+[data-testid="stDateInput"] input,
+textarea,
+[data-baseweb="select"] > div {
+  border-radius: 14px !important;
+  border: 1px solid rgba(116, 232, 255, 0.44) !important;
+  background: rgba(7, 18, 34, 0.98) !important;
+  color: #ffffff !important;
+  font-size: 1rem !important;
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.06);
+}
+
+[data-testid="stTextInput"] input:focus,
+[data-testid="stNumberInput"] input:focus,
+textarea:focus,
+[data-baseweb="select"] > div:focus-within {
+  border-color: rgba(116, 232, 255, 0.82) !important;
+  box-shadow: 0 0 0 1px rgba(116, 232, 255, 0.52), 0 0 0 4px rgba(116, 232, 255, 0.14) !important;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: #d7e3f8 !important;
+}
+
+[data-baseweb="select"] * {
+  color: #ffffff !important;
+}
+
+.stMetric {
+  background: linear-gradient(180deg, rgba(12, 28, 50, 0.96), rgba(8, 18, 31, 0.94));
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 12px 14px;
+  box-shadow: var(--glow);
+}
+
+[data-testid="stMetricLabel"] *,
+[data-testid="stMetricValue"] * {
+  color: #ffffff !important;
+}
+
+[data-testid="stMetricLabel"] * {
+  font-size: 0.96rem !important;
+  font-weight: 700 !important;
+}
+
+[data-testid="stDataFrame"],
+.stDataFrame {
+  border: 1px solid rgba(116, 232, 255, 0.18);
+  border-radius: 14px;
+  background: rgba(8, 19, 36, 0.86);
+}
+
+[data-testid="stDataFrame"] * {
+  color: #f5fbff !important;
+}
+
+.stInfo, .stSuccess, .stWarning, .stError {
+  border-radius: 16px;
+}
+
+.stInfo {
+  background: rgba(92, 230, 255, 0.10);
+}
+
+.stWarning {
+  background: rgba(255, 176, 0, 0.12);
+}
+
+.stSuccess {
+  background: rgba(60, 220, 150, 0.12);
+}
+
+code, pre, .stCode {
+  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace !important;
 }
 
 @media (max-width: 768px) {
-    .hero {
-        padding: 14px 14px;
-        border-radius: 12px;
-    }
-    .hero h2 {
-        font-size: 1.05rem;
-    }
-    .hero p {
-        font-size: 0.9rem;
-    }
-    .panel {
-        padding: 10px 10px 2px 10px;
-        border-radius: 10px;
-    }
-    .card {
-        padding: 10px 10px;
-    }
+  .hero {
+    padding: 20px 18px 18px;
+    border-radius: 18px;
+  }
+  .hero h2 {
+    font-size: 1.45rem !important;
+  }
+  .panel {
+    padding: 14px 14px 4px;
+  }
 }
 </style>
         """,
         unsafe_allow_html=True,
     )
-
 
 def _safe_counts(payload: dict[str, Any]) -> dict[str, Any]:
     diag = payload.get("diagnostics", {}) if isinstance(payload, dict) else {}
@@ -448,18 +680,44 @@ def _search_stocks(query: str) -> list[str]:
 
 
 def _symbol_searchbox(label: str, key: str, placeholder: str, clear_on_submit: bool = True) -> str:
-    """边输边弹候选下拉，点一下即选中，返回可被 resolve_stock_input 解析的字符串。"""
-    selected = st_searchbox(
-        _search_stocks,
-        label=label,
-        placeholder=placeholder,
-        key=key,
-        clear_on_submit=clear_on_submit,
-        rerun_on_update=False,
-        debounce=350,
-    )
-    # selected 为 None（还在输入中）或已选中的字符串如 "600795  国电电力  (GDDL)"
-    return str(selected or "").strip()
+    """稳定的股票搜索输入框，避免输入过程中被自动重置。"""
+    input_key = f"{key}__text"
+    selected_key = f"{key}__selected"
+    just_selected_key = f"{key}__just_selected"
+    clear_pending_key = f"{key}__clear_pending"
+    fill_pending_key = f"{key}__fill_pending"
+
+    pending_fill = st.session_state.pop(fill_pending_key, None)
+    pending_clear = bool(st.session_state.pop(clear_pending_key, False))
+    if pending_fill is not None:
+        st.session_state[input_key] = str(pending_fill)
+    elif pending_clear:
+        st.session_state[input_key] = ""
+
+    typed = st.text_input(label, key=input_key, placeholder=placeholder)
+    query = str(typed or "").strip()
+
+    if query:
+        suggestions = _search_stocks(query)[:8]
+        if suggestions:
+            st.caption("匹配结果（点击即可选中）")
+        elif len(query) >= 2:
+            st.caption("未找到匹配项，可继续输入完整代码或名称。")
+        if suggestions:
+            cols = st.columns(2)
+            for idx, item in enumerate(suggestions):
+                col = cols[idx % 2]
+                if col.button(item, key=f"{key}__pick__{idx}", use_container_width=True):
+                    st.session_state[selected_key] = item
+                    if clear_on_submit:
+                        st.session_state[just_selected_key] = True
+                        st.session_state[clear_pending_key] = True
+                    else:
+                        st.session_state[fill_pending_key] = item
+                    st.rerun()
+
+    selected = str(st.session_state.pop(selected_key, "") or "").strip()
+    return selected or query
 
 
 def _run_export(
@@ -553,9 +811,12 @@ def _run_export(
     }
     hints = _STAGE_HINTS.get(scope, _STAGE_HINTS["all"])
     num_stages = len(hints)
+    event_queue: queue.Queue[str] = queue.Queue()
+    live_log_box = st.empty()
+    live_logs: list[str] = []
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(run_ai_input_export, **kwargs)
+        future = pool.submit(run_ai_input_export, event_queue=event_queue, **kwargs)
         last_step = -1
         while not future.done():
             elapsed = max(0, int(time.time() - start_ts))
@@ -566,16 +827,41 @@ def _run_export(
             if step != last_step:
                 last_step = step
                 status.write(hints[step])
-            time.sleep(1.0)
+
+            while True:
+                try:
+                    line = event_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if not line:
+                    continue
+                live_logs.append(line)
+                if len(live_logs) > 12:
+                    live_logs = live_logs[-12:]
+                live_log_box.code("\n".join(live_logs), language=None)
+
+            time.sleep(0.25)
 
         try:
+            while True:
+                try:
+                    line = event_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if not line:
+                    continue
+                live_logs.append(line)
+                if len(live_logs) > 12:
+                    live_logs = live_logs[-12:]
+            if live_logs:
+                live_log_box.code("\n".join(live_logs), language=None)
             result = future.result()
         except TypeError as exc:
             if ("overwrite_latest" in str(exc)) or ("overrite_latest" in str(exc)):
                 status.write("检测到旧版本函数签名，自动降级重试（不传 overwrite_latest）。")
                 kwargs.pop("overwrite_latest", None)
                 try:
-                    result = run_ai_input_export(**kwargs)
+                    result = run_ai_input_export(event_queue=event_queue, **kwargs)
                 except Exception as inner_exc:
                     status.update(label="导出失败", state="error")
                     st.error(str(inner_exc))
@@ -591,6 +877,9 @@ def _run_export(
 
     progress.progress(100, text="导出完成 100%")
     status.update(label=f"【{scope_label}】导出完成", state="complete")
+    if live_logs:
+        st.caption("最近运行日志")
+        live_log_box.code("\n".join(live_logs[-12:]), language=None)
     if _is_multi:
         st.caption(f"多股票拆分导出完成（{symbols}）")
     elif resolved_symbol:
@@ -614,9 +903,9 @@ def _run_dividend_calc(
     ttm_days: int,
 ) -> None:
     if not symbol.strip():
-        st.error("请输入用于股息率计算的股票代码或名称")
+        st.error("请输入股票代码或名称后再计算。")
         return
-    parsed = _resolve_symbol_for_ui(symbol, "股息率股票")
+    parsed = _resolve_symbol_for_ui(symbol, "股息率工具")
     if not parsed:
         return
     resolved_symbol = str(parsed.get("code", "")).strip()
@@ -629,10 +918,10 @@ def _run_dividend_calc(
         try:
             future_price = float(text)
         except Exception:
-            st.error("未来价格必须是数字")
+            st.error("输入价格格式不正确，请输入数字。")
             return
         if future_price <= 0:
-            st.error("未来价格必须大于 0")
+            st.error("输入价格必须大于 0。")
             return
 
     try:
@@ -650,7 +939,7 @@ def _run_dividend_calc(
             dy_result["ui_has_price"] = True
             dy_result["ui_symbol_resolved"] = f"{symbol} -> {resolved_symbol} {parsed.get('name', '')}".strip()
             dy_result["ui_note"] = (
-                f"已输入价格；当前改为抓取现成股息率口径，日期输入已忽略，锚定日期={anchor_date.isoformat()}"
+                f"已按最近一次分红事件 + 输入价格计算，同时统计截至 {anchor_date.isoformat()} 的 TTM 股息率。"
             )
         else:
             dy_result = calculate_dividend_yield(
@@ -664,9 +953,11 @@ def _run_dividend_calc(
             dy_result["ui_mode"] = "date_based"
             dy_result["ui_has_price"] = False
             dy_result["ui_symbol_resolved"] = f"{symbol} -> {resolved_symbol} {parsed.get('name', '')}".strip()
-            dy_result["ui_note"] = f"未输入价格；当前抓取现成股息率口径，查询日期：{query_date.isoformat()}"
+            dy_result["ui_note"] = (
+                f"已按查询日期匹配分红事件，并回看最近 {max(30, int(ttm_days))} 天统计 TTM；查询日期={query_date.isoformat()}。"
+            )
     except Exception as exc:
-        st.error(f"股息率计算失败: {exc}")
+        st.error(f"股息率计算失败：{exc}")
         return
 
     st.session_state["dividend_yield_result"] = dy_result
@@ -677,115 +968,128 @@ def _render_dividend_result() -> None:
     if not dy_result:
         return
 
-    st.subheader("股息率结果")
+    def _fmt_pct(value: Any) -> str:
+        try:
+            if value is None or value == "":
+                return "-"
+            return f"{float(value):.4f}"
+        except Exception:
+            return str(value)
+
+    def _fmt_num(value: Any, digits: int = 4) -> str:
+        try:
+            if value is None or value == "":
+                return "-"
+            return f"{float(value):.{digits}f}"
+        except Exception:
+            return str(value)
+
+    def _mode_label(mode: str) -> str:
+        mapping = {
+            "exact": "精确匹配除权日",
+            "nearby": "附近日期匹配",
+            "latest_before": "取查询日前最近分红",
+            "strict_no_exact": "严格匹配未命中",
+            "no_nearby": "附近未命中",
+            "latest_event": "最新分红事件",
+            "latest_event_no_before": "使用未来最近分红事件",
+            "ttm_only": "仅输出 TTM 结果",
+            "ready_made_yield": "仅现成 TTM 参考",
+        }
+        return mapping.get(str(mode or ""), str(mode or "-"))
+
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.subheader("股息率测算结果")
+
     note = str(dy_result.get("ui_note", "")).strip()
     if note:
         st.markdown(f'<div class="warn-note">{note}</div>', unsafe_allow_html=True)
-    if str(dy_result.get("pick_mode", "")) == "ready_made_yield":
-        st.info("当前口径：直接抓取现成股息率(TTM)，不做本地分红推导。")
 
-    yields = dy_result.get("yields", {})
+    yields = dy_result.get("yields", {}) if isinstance(dy_result, dict) else {}
     price_info = dy_result.get("price", {}) if isinstance(dy_result, dict) else {}
-    future_price_input = yields.get("future_price_input")
-    ttm_future = yields.get("ttm_yield_pct_at_future_price")
-    ttm_close = yields.get("ttm_yield_pct_at_close")
+    calc_trace = dy_result.get("calculation_trace", {}) if isinstance(dy_result, dict) else {}
+    selected_event = dy_result.get("selected_event") or {}
     close_price = price_info.get("close_price")
-
-    ttm_future_fallback_used = False
-
+    ready_ttm = yields.get("ready_made_ttm_yield_pct")
     has_price_mode = bool(dy_result.get("ui_has_price"))
+    ttm_future_fallback_used = bool((dy_result.get("validation") or {}).get("ttm_fallback_used", False))
+    ttm_info = dy_result.get("ttm", {}) if isinstance(dy_result, dict) else {}
+
     c1, c2, c3 = st.columns(3)
     if has_price_mode:
-        c1.metric(
-            "输入价-单次股息率(%)",
-            f"{(yields.get('selected_event_yield_pct_at_future_price') or 0):.4f}",
-        )
-        c2.metric(
-            "输入价-TTM股息率(%)",
-            f"{(ttm_future or 0):.4f}",
-        )
-        c3.metric(
-            "参考当前价股息率(%)",
-            f"{(yields.get('selected_event_yield_pct_at_close') or 0):.4f}",
-        )
+        c1.metric("输入价-单次股息率(%)", _fmt_pct(yields.get("selected_event_yield_pct_at_future_price")))
+        c2.metric("输入价-TTM股息率(%)", _fmt_pct(yields.get("ttm_yield_pct_at_future_price")))
+        c3.metric("当前收盘-TTM股息率(%)", _fmt_pct(yields.get("ttm_yield_pct_at_close")))
     else:
-        c1.metric(
-            "当前价-单次股息率(%)",
-            f"{(yields.get('selected_event_yield_pct_at_close') or 0):.4f}",
-        )
-        c2.metric(
-            "当前价-TTM股息率(%)",
-            f"{(yields.get('ttm_yield_pct_at_close') or 0):.4f}",
-        )
-        c3.metric(
-            "输入价股息率(%)",
-            f"{(yields.get('selected_event_yield_pct_at_future_price') or 0):.4f}",
-        )
+        c1.metric("当前价-单次股息率(%)", _fmt_pct(yields.get("selected_event_yield_pct_at_close")))
+        c2.metric("当前价-TTM股息率(%)", _fmt_pct(yields.get("ttm_yield_pct_at_close")))
+        c3.metric("现成TTM参考(%)", _fmt_pct(ready_ttm))
 
-    selected_event = dy_result.get("selected_event") or {}
     resolved_text = str(dy_result.get("ui_symbol_resolved", "")).strip()
     if resolved_text:
-        st.caption(f"股票解析: {_fix_mojibake_text(resolved_text)}")
+        st.caption(f"股票解析：{_fix_mojibake_text(resolved_text)}")
     st.caption(
-        f"选取模式: {dy_result.get('pick_mode', '')} | "
-        f"除权日: {selected_event.get('ex_date', '')} | "
-        f"每股分红: {selected_event.get('cash_dividend_per_share_consensus', '')}"
+        f"选取方式：{_mode_label(str(dy_result.get('pick_mode', '')))} | 选中除权日：{selected_event.get('ex_date', '-') or '-'} | 每股分红：{_fmt_num(selected_event.get('cash_dividend_per_share_consensus'))}"
+    )
+    st.caption(
+        f"价格来源：{_fix_mojibake_text(price_info.get('source', '')) or '-'} | 收盘价：{_fmt_num(close_price)} | 价格日期：{price_info.get('price_date', '-') or '-'}"
+    )
+    if yields.get("future_price_input") is not None:
+        st.caption(f"输入价格：{_fmt_num(yields.get('future_price_input'))}")
+    st.caption(
+        f"TTM窗口：{ttm_info.get('window_start', '-') or '-'} ~ {ttm_info.get('window_end', '-') or '-'} | 事件数：{ttm_info.get('event_count', 0)} | 每股累计分红：{_fmt_num(ttm_info.get('cash_dividend_per_share_total'))}"
     )
 
-    ttm_trace = (dy_result.get("calculation_trace") or {}).get("ttm_formula") or {}
-    if ttm_trace:
-        if str(ttm_trace.get("formula", "")).startswith("direct_fetch_ready_made"):
-            st.caption(
-                f"TTM口径: 现成抓取 | 来源: {ttm_trace.get('source', '')} | 值: {ttm_trace.get('result_pct', '')}"
-            )
-        else:
-            st.caption(
-                f"TTM口径: {ttm_trace.get('window_days', '')} 天窗口 | "
-                f"分红合计: {ttm_trace.get('ttm_per_share_sum', '')} / 价格: {ttm_trace.get('close_price', '')}"
-            )
-    elif has_price_mode and (future_price_input is not None):
+    selected_trace = calc_trace.get("selected_event_formula") or {}
+    ttm_trace = calc_trace.get("ttm_formula") or {}
+    if selected_trace:
         st.caption(
-            f"当前为现成口径: 输入价={future_price_input} | 参考现价={close_price} | 现成TTM={ttm_close}"
+            f"单次公式：每股分红 ÷ 价格 × 100 | 每股分红={_fmt_num(selected_trace.get('selected_dividend_per_share'))} | 当前价结果={_fmt_pct(selected_trace.get('result_pct_at_close'))}% | 输入价结果={_fmt_pct(selected_trace.get('result_pct_at_future_price'))}%"
+        )
+    if ttm_trace:
+        st.caption(
+            f"TTM公式：窗口内每股分红合计 ÷ 价格 × 100 | 窗口={ttm_trace.get('window_days')}天 | 每股累计={_fmt_num(ttm_trace.get('ttm_per_share_sum'))} | 当前价结果={_fmt_pct(ttm_trace.get('result_pct_at_close'))}% | 输入价结果={_fmt_pct(ttm_trace.get('result_pct_at_future_price'))}%"
         )
     if ttm_future_fallback_used:
-        st.info("已用回退公式计算输入价-TTM股息率: 现价TTM × 现价 / 输入价")
+        st.info("TTM 结果部分使用了现成参考口径进行补足，请结合下方来源明细复核。")
 
     warnings = dy_result.get("validation", {}).get("warnings", [])
     for warning in warnings:
         st.warning(_fix_mojibake_text(warning))
 
-    ready_sources = ((dy_result.get("calculation_trace") or {}).get("ready_sources") or [])
-    authority_order = ((dy_result.get("calculation_trace") or {}).get("authority_order") or [])
-    authority_pick = ((dy_result.get("calculation_trace") or {}).get("authority_pick") or {})
+    ready_sources = (calc_trace.get("ready_sources") or []) if isinstance(calc_trace, dict) else []
+    authority_order = (calc_trace.get("authority_order") or []) if isinstance(calc_trace, dict) else []
+    authority_pick = (calc_trace.get("authority_pick") or {}) if isinstance(calc_trace, dict) else {}
     if ready_sources:
-        st.caption("现成来源明细（用于兜底交叉）")
-        try:
-            def _order_idx(src: str) -> int:
-                try:
-                    return authority_order.index(src)
-                except Exception:
-                    return 999
+        with st.expander("查看现成 TTM 参考来源", expanded=False):
+            st.caption("该表用于对比外部现成 TTM 股息率来源，最终结果仍以页面顶部指标为准。")
+            try:
+                def _order_idx(src: str) -> int:
+                    try:
+                        return authority_order.index(src)
+                    except Exception:
+                        return 999
 
-            sorted_rows = sorted(ready_sources, key=lambda x: (_order_idx(str(x.get("source", ""))), str(x.get("source", ""))))
-            show_rows = [
-                {
-                    "来源": str(item.get("source", "")),
-                    "状态": "成功" if bool(item.get("ok", True)) else "失败",
-                    "股息率TTM(%)": item.get("yield_pct", None),
-                    "日期": str(item.get("as_of", "")),
-                    "备注": _fix_mojibake_text(item.get("error", "")),
-                }
-                for item in sorted_rows[:5]
-            ]
-            st.dataframe(pd.DataFrame(show_rows), width="stretch", height=180)
-        except Exception:
-            st.json(ready_sources[:5])
+                sorted_rows = sorted(ready_sources, key=lambda item: (_order_idx(str(item.get("source", ""))), str(item.get("source", ""))))
+                show_rows = [
+                    {
+                        "来源": str(item.get("source", "")),
+                        "状态": "成功" if bool(item.get("ok", True)) else "失败",
+                        "TTM股息率(%)": item.get("yield_pct", None),
+                        "日期": str(item.get("as_of", "")),
+                        "备注": _fix_mojibake_text(item.get("error", "")),
+                    }
+                    for item in sorted_rows[:5]
+                ]
+                st.dataframe(pd.DataFrame(show_rows), width="stretch", height=180)
+            except Exception:
+                st.json(ready_sources[:5])
 
     if authority_order:
-        st.caption("权威顺序: " + " > ".join(authority_order))
+        st.caption("现成TTM权威顺序：" + " > ".join(authority_order))
     if authority_pick:
         st.caption(
-            f"当前取值来源: {authority_pick.get('source', '')} | 值: {authority_pick.get('yield_pct', '')} | 日期: {authority_pick.get('as_of', '')}"
+            f"现成TTM当前选源：{authority_pick.get('source', '')} | 数值={authority_pick.get('yield_pct', '')} | 日期={authority_pick.get('as_of', '')}"
         )
 
     dividend_recon = dy_result.get("dividend_per_share_reconciliation", {})
@@ -797,51 +1101,46 @@ def _render_dividend_result() -> None:
     recon_has_diff = bool(dividend_recon.get("has_diff", False)) if isinstance(dividend_recon, dict) else False
 
     if recon_rows:
-        st.caption("每股分红率对盘（多源）")
-        try:
-            def _recon_idx(src: str) -> int:
-                try:
-                    return recon_order.index(src)
-                except Exception:
-                    return 999
+        with st.expander("查看分红对盘明细", expanded=False):
+            st.caption("这里展示各来源分红事件汇总，用于判断每股分红合计是否一致。")
+            try:
+                def _recon_idx(src: str) -> int:
+                    try:
+                        return recon_order.index(src)
+                    except Exception:
+                        return 999
 
-            sorted_recon = sorted(
-                recon_rows,
-                key=lambda x: (_recon_idx(str(x.get("source", ""))), str(x.get("source", ""))),
-            )
-            show_recon = [
-                {
-                    "来源": str(item.get("source", "")),
-                    "每10股分红合计": item.get("per10_sum", None),
-                    "每股分红合计": item.get("per_share_sum", None),
-                    "事件数": item.get("event_count", 0),
-                    "最新除权日": str(item.get("latest_ex_date", "")),
-                }
-                for item in sorted_recon
-            ]
-            st.dataframe(pd.DataFrame(show_recon), width="stretch", height=220)
-        except Exception:
-            st.json(recon_rows)
+                sorted_recon = sorted(recon_rows, key=lambda item: (_recon_idx(str(item.get("source", ""))), str(item.get("source", ""))))
+                show_recon = [
+                    {
+                        "来源": str(item.get("source", "")),
+                        "每10股分红合计": item.get("per10_sum", None),
+                        "每股分红合计": item.get("per_share_sum", None),
+                        "事件数": item.get("event_count", 0),
+                        "最新除权日": str(item.get("latest_ex_date", "")),
+                    }
+                    for item in sorted_recon
+                ]
+                st.dataframe(pd.DataFrame(show_recon), width="stretch", height=220)
+            except Exception:
+                st.json(recon_rows)
 
-        if recon_order:
-            st.caption("分红权威顺序: " + " > ".join(recon_order))
-        if recon_mode:
-            if recon_mode == "consensus":
-                st.caption("分红选源模式: 多源一致优先（共识）")
-                if recon_consensus_sources:
-                    st.caption("共识来源: " + ", ".join([str(x) for x in recon_consensus_sources]))
-            else:
-                st.caption("分红选源模式: 权威顺序降级")
-        if recon_pick:
-            st.caption(
-                f"分红权威选源: {recon_pick.get('source', '')} | 每股合计: {recon_pick.get('per_share_sum', '')} | "
-                f"事件数: {recon_pick.get('event_count', 0)}"
-            )
-        if recon_has_diff:
-            st.warning("分红对盘显示来源间每股分红合计存在差异，当前已按分红权威顺序选源。")
+            if recon_order:
+                st.caption("分红权威顺序：" + " > ".join(recon_order))
+            if recon_mode == "consensus" and recon_consensus_sources:
+                st.caption("分红选源模式：多源共识优先 | 共识来源=" + ", ".join([str(x) for x in recon_consensus_sources]))
+            elif recon_mode:
+                st.caption("分红选源模式：按权威顺序降级。")
+            if recon_pick:
+                st.caption(
+                    f"分红当前选源：{recon_pick.get('source', '')} | 每股合计={recon_pick.get('per_share_sum', '')} | 事件数={recon_pick.get('event_count', 0)}"
+                )
+            if recon_has_diff:
+                st.warning("分红来源间的每股合计存在差异，当前结果已按权威顺序选源。")
 
     with st.expander("查看完整股息率原始结果", expanded=False):
         st.json(dy_result)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def run() -> None:
@@ -851,7 +1150,7 @@ def run() -> None:
     # 兼容热更新后的旧会话对象：若结构不完整，清理旧结果避免属性报错
     _old_result = st.session_state.get("ai_input_result")
     if _old_result is not None:
-        if not hasattr(_old_result, "json_path") or not hasattr(_old_result, "md_path"):
+        if not hasattr(_old_result, "json_path") or not hasattr(_old_result, "md_path") or not hasattr(_old_result, "payload"):
             st.session_state.pop("ai_input_result", None)
 
     with st.sidebar:
@@ -883,20 +1182,36 @@ def run() -> None:
     st.markdown(
         """
 <div class="hero">
-  <h2>投研整合工作台</h2>
-  <p>自动抓取九阳公社研报 + 东方财富个股上下文，输出可直接喂给 AI 的原始输入包；并支持独立股息率测算。</p>
+  <div class="eyebrow">Neo Quant Console</div>
+  <h2>&#25237;&#30740;&#26234;&#33021;&#24037;&#20316;&#21488;</h2>
+  <p>&#30740;&#25253;&#12289;&#20010;&#32929;&#19978;&#19979;&#25991;&#12289;&#34892;&#19994;&#23545;&#26631;&#19982;&#23548;&#20986;&#32467;&#26524;&#38598;&#20013;&#21040;&#21516;&#19968;&#20010;&#30028;&#38754;&#37324;&#65292;&#35753;&#20449;&#24687;&#23637;&#31034;&#26356;&#20687;&#19968;&#20010;&#19987;&#19994;&#30340;&#25237;&#30740;&#25511;&#21046;&#21488;&#12290;</p>
+  <div class="hero-badges">
+    <span>&#30740;&#25253;&#21512;&#24182;</span>
+    <span>&#34892;&#19994;&#23545;&#26631;</span>
+    <span>&#26234;&#33021;&#23548;&#20986;</span>
+    <span>&#32929;&#24687;&#29575;&#27979;&#31639;</span>
+  </div>
 </div>
         """,
         unsafe_allow_html=True,
     )
 
     default_out_dir = str(PROJECT_ROOT)
+    tool_options = ["信息合并导出", "股息率工具"]
+    tool_choice_key = "tool_choice_top"
+    tool_choice_memory_key = "tool_choice_top_memory"
+    if tool_choice_memory_key not in st.session_state:
+        st.session_state[tool_choice_memory_key] = tool_options[0]
+    if st.session_state.get(tool_choice_key) not in tool_options:
+        st.session_state[tool_choice_key] = st.session_state[tool_choice_memory_key]
+
     tool_choice = st.radio(
         "工具选择",
-        options=["信息合并导出", "股息率工具"],
+        options=tool_options,
         horizontal=True,
-        key="tool_choice_top",
+        key=tool_choice_key,
     )
+    st.session_state[tool_choice_memory_key] = tool_choice
 
     btn_reports = False
     btn_stock = False
@@ -928,11 +1243,20 @@ def run() -> None:
         symbol = _symbol_searchbox(
             label="股票代码或名称",
             key="fetch_symbol",
-            placeholder="输入首字母/代码/中文名，选中后自动加入列表",
+            placeholder="输入首字母/代码/中文名，点击候选或按钮加入列表",
         )
 
-        if symbol.strip() and symbol != st.session_state.get("_last_resolved_symbol"):
-            st.session_state["_last_resolved_symbol"] = symbol
+        fetch_auto_selected = bool(st.session_state.pop("fetch_symbol__just_selected", False))
+        _add_c1, _add_c2 = st.columns([1.2, 4.8])
+        add_stock_clicked = _add_c1.button(
+            "加入列表",
+            key="fetch_add_stock",
+            use_container_width=True,
+            disabled=not bool(symbol.strip()),
+        )
+        _add_c2.caption("输入时不会自动重置；点击候选或“加入列表”后才会真正加入。")
+
+        if (add_stock_clicked or fetch_auto_selected) and symbol.strip():
             parsed = _resolve_symbol_for_ui(symbol, "加入股票")
             if parsed:
                 code = str(parsed.get("code", "")).strip()
@@ -940,18 +1264,21 @@ def run() -> None:
                 existing_codes = {s["code"] for s in st.session_state["stock_list"]}
                 if code not in existing_codes:
                     st.session_state["stock_list"].append({"code": code, "name": name, "display": f"{code} {name}"})
-                    for _k in list(st.session_state.keys()):
-                        if _k.startswith("fetch_symbol"):
-                            del st.session_state[_k]
-                    st.session_state["_last_resolved_symbol"] = ""
-                    st.rerun()
+                st.session_state["fetch_symbol__clear_pending"] = True
+                st.session_state.pop("fetch_symbol__selected", None)
+                st.session_state.pop("fetch_symbol__just_selected", None)
+                st.rerun()
 
         if st.session_state["stock_list"]:
             st.caption(f"📋 待分析股票（{len(st.session_state['stock_list'])}只）：")
             _remove_code: str | None = None
             for _i, _s in enumerate(st.session_state["stock_list"]):
                 _sc1, _sc2 = st.columns([5, 1])
-                _sc1.write(f"`{_s['code']}` {_s['name']}")
+                _sc1.markdown(
+                    f'<span style="color:#5ce6ff;font-weight:600">{_s["code"]}</span>'
+                    f'&ensp;<span style="color:#f5fbff;font-size:1.05em;font-weight:500">{_s["name"]}</span>',
+                    unsafe_allow_html=True,
+                )
                 if _sc2.button("✕", key=f"remove_stock_{_s['code']}"):
                     _remove_code = _s["code"]
             if _remove_code is not None:
@@ -963,7 +1290,7 @@ def run() -> None:
                 st.session_state["stock_list"] = []
                 st.rerun()
         else:
-            st.caption('💡 输入股票代码或名称，从下拉选中即自动加入列表；也可直接单股运行。')
+            st.caption("💡 可直接输入后单股运行；也可先加入列表再批量导出。")
         mode = st.radio("东财模式", options=["quick", "deep"], index=1, horizontal=True, key="fetch_mode")
         target_user = st.text_input(
             "九阳用户(名称/UID/主页URL)",
@@ -979,6 +1306,7 @@ def run() -> None:
         overwrite_latest = st.checkbox("覆盖写 latest 文件(推荐)", value=True, key="fetch_overwrite_latest")
         out_dir = st.text_input("输出目录", value=default_out_dir, placeholder=r"例如 G:\lianghua\投研系统", key="fetch_out_dir")
         out_prefix = st.text_input("输出前缀", value="", placeholder="默认 ai_input_bundle", key="fetch_out_prefix")
+        st.caption("批量导出时优先使用列表中的股票；列表为空时会直接使用当前输入值。")
         st.caption("① 每天只需一次 | ② 换股时用 | ③ 首次使用或完整导出")
         _btn_c1, _btn_c2, _btn_c3 = st.columns(3)
         btn_reports = _btn_c1.button("① 研报+要闻", key="fetch_btn_reports", help="仅抓取研报与市场要闻（不需要股票代码）")
@@ -1012,7 +1340,7 @@ def run() -> None:
             max_value=720,
             value=365,
             step=5,
-            help="当前为抓取现成股息率口径，该参数仅保留兼容，不参与计算。",
+            help="用于统计近 N 天内的分红事件并重建 TTM 股息率。",
             key="dy_ttm_days",
         )
         dy_strict = st.checkbox(
@@ -1021,7 +1349,7 @@ def run() -> None:
             disabled=bool(dy_future_price_input.strip()),
             key="dy_strict",
         )
-        st.caption("规则: 当前改为抓取现成股息率口径，不再本地推导分红公式。")
+        st.caption("规则：输入价格时按最近一次分红事件 + 输入价格计算；未输入价格时按查询日期匹配除权日，并同步统计 TTM。")
         dy_btn = st.button("计算股息率", width="stretch", key="dy_btn")
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1096,65 +1424,69 @@ def run() -> None:
             ttm_days=int(dy_ttm_days),
         )
 
-    result = st.session_state.get("ai_input_result")
-    if result:
-        assert isinstance(result, AiInputExportResult)
-        json_paths = getattr(result, "json_paths", None) or [result.json_path]
-        md_paths = getattr(result, "md_paths", None) or [result.md_path]
-        preview_path = result.json_path
-        if len(json_paths) > 1:
-            path_map = {p.name: p for p in json_paths}
-            selected_name = st.selectbox("预览文件", options=list(path_map.keys()), key="ai_input_preview_json")
-            preview_path = path_map.get(selected_name, result.json_path)
-        payload = result.payload
-        if preview_path != result.json_path:
-            try:
-                payload = json.loads(preview_path.read_text(encoding="utf-8"))
-            except Exception:
-                payload = result.payload
-        meta = payload.get("meta", {})
-        counts = _safe_counts(payload)
-        instruction = payload.get("llm_instruction", {}) if isinstance(payload, dict) else {}
+    # ── 结果展示区：按当前工具类型分别显示，避免切换工具时结果"串台" ──
+    if tool_choice == "信息合并导出":
+        result = st.session_state.get("ai_input_result")
+        if result:
+            assert isinstance(result, AiInputExportResult)
+            json_paths = getattr(result, "json_paths", None) or [result.json_path]
+            md_paths = getattr(result, "md_paths", None) or [result.md_path]
+            preview_path = result.json_path
+            if len(json_paths) > 1:
+                path_map = {p.name: p for p in json_paths}
+                selected_name = st.selectbox("预览文件", options=list(path_map.keys()), key="ai_input_preview_json")
+                preview_path = path_map.get(selected_name, result.json_path)
+            payload = result.payload
+            if preview_path != result.json_path:
+                try:
+                    payload = json.loads(preview_path.read_text(encoding="utf-8"))
+                except Exception:
+                    payload = result.payload
+            meta = payload.get("meta", {})
+            counts = _safe_counts(payload)
+            instruction = payload.get("llm_instruction", {}) if isinstance(payload, dict) else {}
 
-        st.success("AI 输入文件已生成")
-        if not bool(instruction.get("attached")):
-            err_text = str(instruction.get("error", "")).strip()
-            st.warning(f"当前导出未附带提示词内容。{err_text}" if err_text else "当前导出未附带提示词内容。")
-        latest_hint = "（当前为 latest 覆盖文件）" if "latest" in preview_path.name.lower() else ""
-        path_lines: list[str] = []
-        for p in json_paths:
-            path_lines.append(f"JSON: {p}")
-            md_candidate = next((m for m in md_paths if m.stem == p.stem), None)
-            if md_candidate:
-                path_lines.append(f"Markdown: {md_candidate}")
-        st.markdown(
-            f"""
+            st.success("AI 输入文件已生成")
+            if not bool(instruction.get("attached")):
+                err_text = str(instruction.get("error", "")).strip()
+                st.warning(f"当前导出未附带提示词内容。{err_text}" if err_text else "当前导出未附带提示词内容。")
+            latest_hint = "（当前为 latest 覆盖文件）" if "latest" in preview_path.name.lower() else ""
+            path_lines: list[str] = []
+            for p in json_paths:
+                path_lines.append(f"JSON: {p}")
+                md_candidate = next((m for m in md_paths if m.stem == p.stem), None)
+                if md_candidate:
+                    path_lines.append(f"Markdown: {md_candidate}")
+            st.markdown(
+                f"""
 <div class="path-box">
 {'<br/>'.join(path_lines)} {latest_hint}
 </div>
-            """,
-            unsafe_allow_html=True,
-        )
+                """,
+                unsafe_allow_html=True,
+            )
 
-        _render_kpi_cards(counts)
-        st.caption(
-            f"请求日: {meta.get('request_date', '')} | "
-            f"研报目标日: {meta.get('report_target_date', meta.get('target_date', ''))}"
-        )
-        _render_downloads(result)
+            _render_kpi_cards(counts)
+            st.caption(
+                f"请求日: {meta.get('request_date', '')} | "
+                f"研报目标日: {meta.get('report_target_date', meta.get('target_date', ''))}"
+            )
+            _render_downloads(result)
 
-        t1, t2, t3 = st.tabs(["研报原文", "个股上下文", "接口诊断"])
-        with t1:
-            _render_reports(payload)
-        with t2:
-            _render_stock_context(payload)
-        with t3:
-            _render_diagnostics(payload)
+            t1, t2, t3 = st.tabs(["研报原文", "个股上下文", "接口诊断"])
+            with t1:
+                _render_reports(payload)
+            with t2:
+                _render_stock_context(payload)
+            with t3:
+                _render_diagnostics(payload)
+        else:
+            st.info("在上方填写参数后，点击导出按钮生成 AI 输入包。")
     else:
-        st.info("在上方选择“信息合并导出”，填写参数后点击导出按钮。")
-
-    st.divider()
-    _render_dividend_result()
+        # 股息率工具：只显示股息率结果
+        if st.session_state.get("dividend_yield_result"):
+            st.divider()
+            _render_dividend_result()
 
 
 if __name__ == "__main__":

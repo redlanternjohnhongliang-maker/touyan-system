@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import math
 import os
@@ -8,6 +9,7 @@ import re
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
+import time
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -17,6 +19,26 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.collectors.eastmoney_adapter import fetch_stock_bundle, fetch_market_headlines
 from src.collectors.jiuyangongshe_collector import fetch_daily_reports_for_user
 from src.services.symbol_resolver import resolve_stock_input
+
+
+def _emit_progress(message: str) -> None:
+    print(str(message), file=sys.stderr, flush=True)
+
+
+def _stock_fetch_workers() -> int:
+    try:
+        return max(1, min(6, int(os.getenv("QUANT_EXPORT_MAX_WORKERS", "3"))))
+    except Exception:
+        return 3
+
+
+def _fetch_bundle_for_export(code: str, name: str, mode: str, target_day: date) -> tuple[str, str, dict[str, Any]]:
+    started = time.perf_counter()
+    _emit_progress(f"[stock:start] {code} {name or code}")
+    bundle = fetch_stock_bundle(code, mode=mode, include_headlines=False, as_of_date=target_day)
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    _emit_progress(f"[stock:done] {code} {name or code} {elapsed_ms}ms")
+    return code, name, bundle
 
 
 # --------------- 日缓存（研报+要闻） ---------------
@@ -1000,18 +1022,22 @@ def main() -> None:
 
     # ---- scope=reports: 只拉研报+要闻，不需要股票代码 ----
     if scope == "reports":
+        _emit_progress(f"[reports:start] {args.target_user} {report_target_date.isoformat()}")
         reports = fetch_daily_reports_for_user(
             target_user=args.target_user,
             target_date=report_target_date,
             window_days=max(1, args.window_days),
             strict_date=strict_date,
         )
+        _emit_progress(f"[reports:done] count={len(reports)}")
         # 历史日期不抓实时要闻
         if is_historical:
             print(f"历史日期模式（{target_date}）：跳过抓取实时要闻", file=sys.stderr)
             headlines, headlines_meta = [], {}
         else:
+            _emit_progress("[hotnews:start]")
             headlines, headlines_meta = fetch_market_headlines(max_items_per_source=5, max_total=10)
+            _emit_progress(f"[hotnews:done] count={len(headlines)}")
         _save_daily_cache(cache_path, reports, headlines, headlines_meta,
                           args.target_user, report_target_date, args.window_days)
         # 输出一个精简 payload（不含个股上下文）
@@ -1072,13 +1098,22 @@ def main() -> None:
         # ======= 多股票拆分导出模式 =======
         # 拉研报（仅第一次或 scope=all 时）
         headlines_merged: list[dict[str, Any]] = []
+        headlines_meta: dict[str, Any] = {}
         if scope == "all":
+            _emit_progress(f"[reports:start] {args.target_user} {report_target_date.isoformat()}")
             reports = fetch_daily_reports_for_user(
                 target_user=args.target_user,
                 target_date=report_target_date,
                 window_days=max(1, args.window_days),
                 strict_date=strict_date,
             )
+            _emit_progress(f"[reports:done] count={len(reports)}")
+            if not is_historical:
+                _emit_progress("[hotnews:start]")
+                headlines_merged, headlines_meta = fetch_market_headlines(max_items_per_source=5, max_total=10)
+                _emit_progress(f"[hotnews:done] count={len(headlines_merged)}")
+            _save_daily_cache(cache_path, reports, headlines_merged, headlines_meta,
+                              args.target_user, report_target_date, args.window_days)
         else:
             # scope=stock: 从缓存加载研报+要闻
             cached = _load_daily_cache(cache_path)
@@ -1089,24 +1124,25 @@ def main() -> None:
                 reports = []
 
         per_stock_bundles: list[tuple[str, str, dict[str, Any]]] = []
+        bundle_map: dict[str, tuple[str, dict[str, Any]]] = {}
+        max_workers = min(_stock_fetch_workers(), len(resolved_pairs))
+        _emit_progress(f"[stocks:start] count={len(resolved_pairs)} workers={max_workers}")
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_map = {
+                pool.submit(_fetch_bundle_for_export, _code, _name, args.mode, report_target_date): (_code, _name)
+                for _code, _name in resolved_pairs
+            }
+            for future in as_completed(future_map):
+                _code, _name = future_map[future]
+                code_done, name_done, bundle_done = future.result()
+                if headlines_merged:
+                    bundle_done["market_hot_news_top10"] = headlines_merged
+                bundle_map[code_done] = (name_done, bundle_done)
+        _emit_progress("[stocks:done]")
 
-        for _pair_idx, (_code, _name) in enumerate(resolved_pairs):
-            print(f"正在抓取 [{_pair_idx + 1}/{len(resolved_pairs)}] {_code} {_name} ...", file=sys.stderr)
-            # 第一只股票拉 headline（仅非历史日期），后续不重复拉
-            _include_hl = (_pair_idx == 0) and (scope == "all") and (not is_historical)
-            _bundle = fetch_stock_bundle(_code, mode=args.mode, include_headlines=_include_hl, as_of_date=report_target_date)
-            if _pair_idx == 0 and scope == "all":
-                if not is_historical:
-                    headlines_merged = _bundle.get("market_hot_news_top10", [])
-                # scope=all 时顺便保存缓存
-                _save_daily_cache(cache_path, reports, headlines_merged, {},
-                                  args.target_user, report_target_date, args.window_days)
+        for _code, _name in resolved_pairs:
+            _name, _bundle = bundle_map[_code]
 
-            # 补充 headline 到每只股票（引用同一份）
-            if headlines_merged:
-                _bundle["market_hot_news_top10"] = headlines_merged
-
-            # 兜底名称提取
             if not _name:
                 _name_keys_inner = ["股票简称", "证券简称", "名称", "SECURITY_NAME_ABBR"]
                 for _sec in ("yjbb", "financial_indicator", "gdhs", "ggcg", "notice", "news"):
@@ -1153,6 +1189,7 @@ def main() -> None:
             json_path = out_dir / f"{base}.json"
             md_path = out_dir / f"{base}.md"
 
+            _emit_progress(f"[write] {json_path.name}")
             _dump_json(json_path, payload)
             md_path.write_text(_build_markdown(payload), encoding="utf-8")
             print(str(json_path.resolve()))
@@ -1177,20 +1214,30 @@ def main() -> None:
             reports = []
     else:
         # scope=all: 原始逻辑——全部拉取
+        _emit_progress(f"[reports:start] {args.target_user} {report_target_date.isoformat()}")
         reports = fetch_daily_reports_for_user(
             target_user=args.target_user,
             target_date=report_target_date,
             window_days=max(1, args.window_days),
             strict_date=strict_date,
         )
+        _emit_progress(f"[reports:done] count={len(reports)}")
         # 历史日期不抓实时要闻
-        _include_hl = not is_historical
         if is_historical:
             print(f"历史日期模式（{target_date}）：跳过抓取实时要闻", file=sys.stderr)
-        bundle = fetch_stock_bundle(resolved_symbol, mode=args.mode, include_headlines=_include_hl, as_of_date=report_target_date)
+            hot_headlines: list[dict[str, Any]] = []
+            hot_headlines_meta: dict[str, Any] = {}
+        else:
+            _emit_progress("[hotnews:start]")
+            hot_headlines, hot_headlines_meta = fetch_market_headlines(max_items_per_source=5, max_total=10)
+            _emit_progress(f"[hotnews:done] count={len(hot_headlines)}")
+        _emit_progress(f"[stock:start] {resolved_symbol} {resolved_name or resolved_symbol}")
+        bundle = fetch_stock_bundle(resolved_symbol, mode=args.mode, include_headlines=False, as_of_date=report_target_date)
+        _emit_progress(f"[stock:done] {resolved_symbol} {resolved_name or resolved_symbol}")
+        if hot_headlines:
+            bundle["market_hot_news_top10"] = hot_headlines
         # 顺便保存日缓存（副产品）
-        _hl = bundle.get("market_hot_news_top10", []) if not is_historical else []
-        _save_daily_cache(cache_path, reports, _hl, {},
+        _save_daily_cache(cache_path, reports, hot_headlines, hot_headlines_meta,
                           args.target_user, report_target_date, args.window_days)
 
     payload = _build_ai_payload(
@@ -1235,6 +1282,7 @@ def main() -> None:
     json_path = out_dir / f"{base}.json"
     md_path = out_dir / f"{base}.md"
 
+    _emit_progress(f"[write] {json_path.name}")
     _dump_json(json_path, payload)
     md_path.write_text(_build_markdown(payload), encoding="utf-8")
 

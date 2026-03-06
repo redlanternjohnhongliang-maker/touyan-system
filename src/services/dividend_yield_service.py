@@ -373,6 +373,31 @@ def _group_events(evidences: list[DividendEvidence]) -> list[dict[str, Any]]:
     return events
 
 
+def _filter_ttm_events(events: list[dict[str, Any]], as_of: date, ttm_days: int) -> list[dict[str, Any]]:
+    window_days = max(30, int(ttm_days))
+    window_start = as_of - timedelta(days=window_days)
+    picked: list[dict[str, Any]] = []
+    for event in events:
+        ex_date = _parse_date(event.get("ex_date", ""))
+        if not ex_date:
+            continue
+        if window_start <= ex_date <= as_of:
+            picked.append(event)
+    picked.sort(key=lambda item: str(item.get("ex_date", "")))
+    return picked
+
+
+def _yield_pct(cash_dividend_per_share: float | None, price: float | None) -> float | None:
+    if cash_dividend_per_share is None or price is None:
+        return None
+    try:
+        if float(price) <= 0:
+            return None
+        return round(float(cash_dividend_per_share) / float(price) * 100.0, 4)
+    except Exception:
+        return None
+
+
 def _pick_event_for_date(
     events: list[dict[str, Any]],
     target_date: date,
@@ -1034,21 +1059,42 @@ def calculate_dividend_yield(
             raise ValueError(f"invalid query_date: {query_date}")
         qd = parsed
 
-    # 改为仅抓取“现成股息率口径”，不再做本地分红事件推导
     code = _normalize_symbol(symbol)
     price, price_date, price_source = _fetch_price(code, qd)
     warnings: list[str] = []
 
     dividend_evidences, dividend_round_meta = _fetch_dividend_evidences_multi_round(code, rounds=2)
+    grouped_events = _group_events(dividend_evidences)
     dividend_summary = _summarize_dividend_evidences(dividend_evidences, as_of=qd, ttm_days=int(ttm_days))
     dividend_source_rows = dividend_summary.get("source_rows", []) if isinstance(dividend_summary, dict) else []
     dividend_pick, dividend_pick_meta = _pick_dividend_source_with_consensus(dividend_source_rows)
 
+    if use_latest_event:
+        selected_event, selected_mode = _pick_latest_event(grouped_events, qd)
+    else:
+        selected_event, selected_mode = _pick_event_for_date(grouped_events, qd, strict_date, nearby_days)
+
+    ttm_window_days = max(30, int(ttm_days))
+    ttm_events = _filter_ttm_events(grouped_events, qd, ttm_window_days)
+    ttm_per_share_sum = round(
+        sum(float(item.get("cash_dividend_per_share_consensus", 0.0) or 0.0) for item in ttm_events),
+        6,
+    )
+
+    selected_per_share: float | None = None
+    if selected_event:
+        selected_per_share = float(selected_event.get("cash_dividend_per_share_consensus", 0.0) or 0.0)
+
+    selected_event_yield_close = _yield_pct(selected_per_share, price)
+    ttm_yield_close = _yield_pct(ttm_per_share_sum, price)
+    selected_event_yield_future = _yield_pct(selected_per_share, future_price)
+    ttm_yield_future = _yield_pct(ttm_per_share_sum, future_price)
+
     source_attempts = _collect_ready_made_yield_attempts(code, as_of=qd)
     source_rows = [item for item in source_attempts if item.get("ok")]
-    values = [float(item.get("yield_pct")) for item in source_rows if item.get("yield_pct") is not None]
-    ready_ttm_yield: float | None = float(median(values)) if values else None
-    ready_source = "multi_source_consensus_median" if values else ""
+    ready_values = [float(item.get("yield_pct")) for item in source_rows if item.get("yield_pct") is not None]
+    ready_ttm_yield: float | None = float(median(ready_values)) if ready_values else None
+    ready_source = "multi_source_consensus_median" if ready_values else ""
     ready_date = source_rows[0].get("as_of", qd.isoformat()) if source_rows else ""
     ready_raw = {"sources": source_rows}
     authority_pick = _pick_by_authority(source_rows)
@@ -1057,77 +1103,103 @@ def calculate_dividend_yield(
         ready_source = str(authority_pick.get("source", ""))
         ready_date = str(authority_pick.get("as_of", ready_date))
 
-    if (
-        ready_ttm_yield is None
-        and price is not None
-        and float(price) > 0
-        and dividend_pick is not None
-        and float(dividend_pick.get("per_share_sum", 0.0)) > 0
-    ):
-        ready_ttm_yield = float(dividend_pick.get("per_share_sum", 0.0)) / float(price) * 100.0
-        ready_source = str(dividend_pick.get("source", "")) + "_reconstructed"
-        ready_date = qd.isoformat()
-        warnings.append("现成股息率缺失，已按多源分红对盘重建")
+    ttm_fallback_used = False
+    if ttm_yield_close is None and ready_ttm_yield is not None:
+        ttm_yield_close = ready_ttm_yield
+        ttm_fallback_used = True
+    if future_price is not None and ttm_yield_future is None and ready_ttm_yield is not None and price is not None and float(price) > 0:
+        ttm_yield_future = round(float(ready_ttm_yield) * float(price) / float(future_price), 4)
+        ttm_fallback_used = True
+
+    if selected_event is None:
+        if use_latest_event:
+            warnings.append("未找到可用的最新分红事件，本次仅保留 TTM 结果作为参考。")
+        elif strict_date:
+            warnings.append("严格匹配除权日时未命中对应分红事件，请检查查询日期。")
+        else:
+            warnings.append("查询日期附近未找到匹配分红事件，本次仅保留 TTM 结果。")
+
+    if price is None or float(price) <= 0:
+        warnings.append("未获取到有效收盘价，部分收益率结果可能为空。")
 
     if ready_ttm_yield is None:
-        warnings.append("未抓取到现成股息率(TTM)，请稍后重试或切换股票")
+        warnings.append("外部现成 TTM 股息率暂无可用数据。")
     elif len(source_rows) == 1:
-        warnings.append("当前仅命中1个现成来源，建议结合其他终端交叉确认")
-    if len(values) >= 2:
-        distinct_vals = sorted(set(round(v, 6) for v in values))
+        warnings.append("现成 TTM 股息率仅命中 1 个来源，建议结合分红事件复核。")
+
+    if len(ready_values) >= 2:
+        distinct_vals = sorted(set(round(v, 6) for v in ready_values))
         if len(distinct_vals) > 1:
-            warnings.append(f"来源间股息率存在差异: {distinct_vals}；已按权威顺序取值")
+            warnings.append(f"现成 TTM 股息率多来源存在差异：{distinct_vals}，已按权威顺序择优。")
+
+    if (
+        ready_ttm_yield is not None
+        and ttm_yield_close is not None
+        and abs(float(ready_ttm_yield) - float(ttm_yield_close)) > 0.35
+    ):
+        warnings.append(
+            f"现成 TTM={ready_ttm_yield:.4f}% 与事件重建 TTM={ttm_yield_close:.4f}% 差异较大，建议人工复核。"
+        )
+
     if dividend_summary.get("has_diff"):
         if str(dividend_pick_meta.get("mode", "")) == "consensus":
             warnings.append(
-                f"每股分红对盘有差异，但已采用多源一致值: {dividend_pick.get('consensus_sources', [])}"
+                f"分红对盘存在多源差异，但以下来源已形成共识：{(dividend_pick or {}).get('consensus_sources', [])}。"
             )
         else:
             warnings.append(
-                f"每股分红对盘存在差异: {dividend_summary.get('distinct_per_share_sum', [])}；"
-                f"已按权威顺序{SOURCE_DIVIDEND_AUTHORITY_ORDER}选取"
+                f"分红对盘存在差异：{dividend_summary.get('distinct_per_share_sum', [])}，当前按分红权威顺序 {SOURCE_DIVIDEND_AUTHORITY_ORDER} 选源。"
             )
-    if future_price is not None:
-        warnings.append("当前已切换为抓取现成股息率口径；输入价换算已关闭")
 
-    selected_event = {
+    selected_event_output = selected_event or {
         "ex_date": ready_date or qd.isoformat(),
         "cash_dividend_per_share_consensus": None,
         "source": ready_source,
+        "source_count": len(source_rows),
+        "confidence": "reference_only",
+        "evidences": [],
     }
+
+    pick_mode = "ready_made_yield"
+    if selected_event is not None:
+        pick_mode = "latest_event" if use_latest_event else str(selected_mode or "event")
+    elif ttm_yield_close is not None:
+        pick_mode = "ttm_only"
 
     result: dict[str, Any] = {
         "symbol": code,
         "query_date": qd.isoformat(),
-        "pick_mode": "ready_made_yield",
+        "pick_mode": pick_mode,
         "price": {
             "close_price": price,
             "price_date": price_date,
             "source": price_source,
         },
-        "selected_event": selected_event,
+        "selected_event": selected_event_output,
         "yields": {
-            "selected_event_yield_pct_at_close": ready_ttm_yield,
-            "selected_event_yield_pct_at_future_price": None,
+            "selected_event_yield_pct_at_close": selected_event_yield_close,
+            "selected_event_yield_pct_at_future_price": selected_event_yield_future,
             "future_price_input": future_price,
-            "ttm_yield_pct_at_close": ready_ttm_yield,
-            "ttm_yield_pct_at_future_price": None,
+            "ttm_yield_pct_at_close": ttm_yield_close,
+            "ttm_yield_pct_at_future_price": ttm_yield_future,
+            "ready_made_ttm_yield_pct": ready_ttm_yield,
         },
         "ttm": {
-            "days": None,
-            "window_start": "",
+            "days": ttm_window_days,
+            "window_start": (qd - timedelta(days=ttm_window_days)).isoformat(),
             "window_end": qd.isoformat(),
-            "window_type": "recent_4_quarters",
+            "window_type": "rolling_days",
             "quarters": dividend_summary.get("quarters", []),
-            "cash_dividend_per_share_total": None,
-            "event_count": 0,
-            "events": [],
+            "cash_dividend_per_share_total": ttm_per_share_sum,
+            "event_count": len(ttm_events),
+            "events": ttm_events,
         },
         "validation": {
             "source_counts": {item.get("source", ""): 1 for item in source_rows},
-            "total_evidence_count": len(source_rows),
-            "event_count": int(sum(int(item.get("event_count", 0)) for item in dividend_source_rows)),
+            "total_evidence_count": len(dividend_evidences),
+            "event_count": len(grouped_events),
             "warnings": warnings,
+            "ttm_fallback_used": ttm_fallback_used,
         },
         "dividend_per_share_reconciliation": {
             "authority_order": SOURCE_DIVIDEND_AUTHORITY_ORDER,
@@ -1144,18 +1216,25 @@ def calculate_dividend_yield(
         },
         "calculation_trace": {
             "selected_event_formula": {
-                "formula": "direct_fetch_ready_made_yield_authority_order",
-                "result_pct": ready_ttm_yield,
-                "source": ready_source,
-                "as_of": ready_date,
+                "formula": "selected_dividend_per_share / price * 100",
+                "selected_dividend_per_share": selected_per_share,
+                "close_price": price,
+                "future_price": future_price,
+                "result_pct_at_close": selected_event_yield_close,
+                "result_pct_at_future_price": selected_event_yield_future,
+                "mode": selected_mode,
             },
             "ttm_formula": {
-                "formula": "direct_fetch_ready_made_ttm_yield_authority_order",
-                "result_pct": ready_ttm_yield,
-                "source": ready_source,
-                "window_days": None,
-                "window_type": "recent_4_quarters",
-                "quarters": dividend_summary.get("quarters", []),
+                "formula": "sum(ttm_dividend_per_share_events) / price * 100",
+                "ttm_per_share_sum": ttm_per_share_sum,
+                "close_price": price,
+                "future_price": future_price,
+                "result_pct_at_close": ttm_yield_close,
+                "result_pct_at_future_price": ttm_yield_future,
+                "window_days": ttm_window_days,
+                "window_type": "rolling_days",
+                "event_count": len(ttm_events),
+                "fallback_used": ttm_fallback_used,
             },
             "raw_source": ready_raw,
             "authority_order": SOURCE_AUTHORITY_ORDER,
@@ -1171,3 +1250,4 @@ def calculate_dividend_yield(
         },
     }
     return result
+
