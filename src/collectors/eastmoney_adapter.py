@@ -1841,6 +1841,214 @@ def _fetch_sector_kline_akshare(
         return []
 
 
+def _extract_security_code(item: dict[str, Any]) -> str:
+    for key in ["代码", "股票代码", "证券代码", "SECURITY_CODE", "SECUCODE", "symbol"]:
+        code = _normalize_symbol_text(item.get(key, ""))
+        if len(code) == 6 and code.isdigit():
+            return code
+    return ""
+
+
+def _extract_security_name(item: dict[str, Any]) -> str:
+    for key in ["名称", "股票名称", "股票简称", "证券简称", "SECURITY_NAME_ABBR", "name"]:
+        name = str(item.get(key, "") or "").strip()
+        if name:
+            return name
+    return ""
+
+
+def _fetch_board_constituents_em(board_code: str, board_name: str = "") -> list[dict[str, str]]:
+    """通过 EastMoney push2 获取行业板块全量成分股列表。"""
+    code = str(board_code or "").strip().upper()
+    if not code:
+        return []
+
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    page_size = 200
+    for host in _KLINE_HOSTS:
+        try:
+            page_no = 1
+            host_rows: list[dict[str, str]] = []
+            while True:
+                params = {
+                    "pn": str(page_no),
+                    "pz": str(page_size),
+                    "po": "1",
+                    "np": "1",
+                    "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+                    "fltt": "2",
+                    "invt": "2",
+                    "fid": "f3",
+                    "fs": f"b:{code} f:!50",
+                    "fields": "f12,f14",
+                }
+                with _without_proxy_env():
+                    os.environ["NO_PROXY"] = "*"
+                    resp = requests.get(
+                        f"https://{host}{_BOARD_LIST_PATH}",
+                        params=params,
+                        headers=_DC_HEADERS,
+                        timeout=15,
+                        verify=False,
+                    )
+                data = resp.json()
+                diff = ((data.get("data") or {}).get("diff") or [])
+                if not diff:
+                    break
+                page_added = 0
+                for item in diff:
+                    stock_code = _extract_security_code(item)
+                    if not stock_code or stock_code in seen:
+                        continue
+                    seen.add(stock_code)
+                    host_rows.append({
+                        "code": stock_code,
+                        "name": _extract_security_name(item),
+                        "board_code": code,
+                        "board_name": board_name,
+                    })
+                    page_added += 1
+                if len(diff) < page_size or page_added == 0:
+                    break
+                page_no += 1
+            if host_rows:
+                out = host_rows
+                break
+        except Exception as e:
+            logger.debug("fetch_board_constituents_em failed board=%s host=%s: %s", code, host, e)
+            continue
+    return out
+
+
+def _stock_secid(symbol: str) -> str:
+    code = _normalize_symbol_text(symbol)
+    if not code:
+        return ""
+    market = "1" if code.startswith(("5", "6", "9")) else "0"
+    return f"{market}.{code}"
+
+
+def _kline_rows_sufficient(records: list[dict[str, Any]], max_days: int) -> bool:
+    min_required = min(max_days, 20)
+    return len(records) >= min_required
+
+
+def _fetch_stock_hist_for_sector_synth(
+    symbol: str,
+    ak_module: Any,
+    start_date: str,
+    end_date: str,
+    ref_date: date,
+    max_days: int,
+) -> list[dict[str, Any]]:
+    """获取单只个股近期日 K，用于全板块合成兜底。"""
+    secid = _stock_secid(symbol)
+    if not secid:
+        return []
+    return _fetch_kline_by_secid(secid, days=max_days + 30, ref_date=ref_date)
+
+
+def _synthesize_sector_kline_from_all_constituents(
+    board_code: str,
+    board_name: str,
+    ak_module: Any,
+    ref_date: date,
+    max_days: int = 60,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """使用板块全量成分股合成行业板块 K 线，不做抽样。"""
+    constituents = _fetch_board_constituents_em(board_code=board_code, board_name=board_name)
+    total_constituents = len(constituents)
+    if total_constituents == 0:
+        return [], {"total": 0, "hist_ok": 0, "daily_points": 0}
+
+    start_date = (ref_date - timedelta(days=max_days + 45)).strftime("%Y%m%d")
+    end_date = ref_date.strftime("%Y%m%d")
+
+    histories: dict[str, list[dict[str, Any]]] = {}
+
+    def _worker(item: dict[str, str]) -> tuple[str, list[dict[str, Any]]]:
+        code = item.get("code", "")
+        return code, _fetch_stock_hist_for_sector_synth(code, ak_module, start_date, end_date, ref_date, max_days)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(_worker, item) for item in constituents]
+        for future in as_completed(futures):
+            try:
+                code, records = future.result()
+            except Exception:
+                continue
+            if records:
+                histories[code] = records
+
+    daily_bucket: dict[str, dict[str, Any]] = {}
+    for records in histories.values():
+        sorted_records = sorted(records, key=lambda x: str(x.get("日期", x.get("date", ""))))
+        for idx in range(1, len(sorted_records)):
+            prev_row = sorted_records[idx - 1]
+            curr_row = sorted_records[idx]
+            prev_close = _safe_float(prev_row.get("收盘", prev_row.get("close", 0)))
+            if prev_close <= 0:
+                continue
+            trade_date = str(curr_row.get("日期", curr_row.get("date", "")))[:10]
+            if not trade_date:
+                continue
+            bucket = daily_bucket.setdefault(trade_date, {
+                "open": [], "close": [], "high": [], "low": [], "volume": 0, "count": 0,
+            })
+            open_v = _safe_float(curr_row.get("开盘", curr_row.get("open", 0)))
+            close_v = _safe_float(curr_row.get("收盘", curr_row.get("close", 0)))
+            high_v = _safe_float(curr_row.get("最高", curr_row.get("high", 0)))
+            low_v = _safe_float(curr_row.get("最低", curr_row.get("low", 0)))
+            bucket["open"].append(open_v / prev_close - 1)
+            bucket["close"].append(close_v / prev_close - 1)
+            bucket["high"].append(high_v / prev_close - 1)
+            bucket["low"].append(low_v / prev_close - 1)
+            bucket["volume"] += int(float(curr_row.get("成交量", curr_row.get("volume", 0)) or 0))
+            bucket["count"] += 1
+
+    if not daily_bucket:
+        return [], {"total": total_constituents, "hist_ok": len(histories), "daily_points": 0}
+
+    records: list[dict[str, Any]] = []
+    synthetic_prev_close = 100.0
+    for trade_date in sorted(daily_bucket.keys()):
+        bucket = daily_bucket[trade_date]
+        if not bucket["close"]:
+            continue
+        avg_open_ret = sum(bucket["open"]) / len(bucket["open"])
+        avg_close_ret = sum(bucket["close"]) / len(bucket["close"])
+        avg_high_ret = sum(bucket["high"]) / len(bucket["high"])
+        avg_low_ret = sum(bucket["low"]) / len(bucket["low"])
+
+        open_px = synthetic_prev_close * (1 + avg_open_ret)
+        close_px = synthetic_prev_close * (1 + avg_close_ret)
+        high_px = synthetic_prev_close * (1 + avg_high_ret)
+        low_px = synthetic_prev_close * (1 + avg_low_ret)
+        high_px = max(high_px, open_px, close_px)
+        low_px = min(low_px, open_px, close_px)
+        pct = 0.0 if synthetic_prev_close <= 0 else round((close_px - synthetic_prev_close) / synthetic_prev_close * 100, 4)
+
+        records.append({
+            "日期": trade_date,
+            "开盘": round(open_px, 4),
+            "收盘": round(close_px, 4),
+            "最高": round(high_px, 4),
+            "最低": round(low_px, 4),
+            "成交量": int(bucket["volume"]),
+            "涨跌幅": pct,
+            "成分股覆盖数": int(bucket["count"]),
+            "成分股总数": int(total_constituents),
+        })
+        synthetic_prev_close = close_px
+
+    return records[-max_days:], {
+        "total": total_constituents,
+        "hist_ok": len(histories),
+        "daily_points": len(records),
+    }
+
+
 def _fetch_sector_and_benchmark_klines(
     symbol: str,
     company_profile: dict[str, str],
@@ -1868,6 +2076,8 @@ def _fetch_sector_and_benchmark_klines(
         "sector_kline_60d": [],
         "csi300_kline_60d": [],
     }
+    best_short_sector_records: list[dict[str, Any]] = []
+    best_short_sector_name = ""
 
     # ── 1. 行业板块 K 线（优先主营业务对应三级行业） ──
     board_candidates = [
@@ -1890,39 +2100,90 @@ def _fetch_sector_and_benchmark_klines(
             result["sector_name"] = board_name
             secid = f"90.{board_code}"
             records = _fetch_kline_by_secid(secid, days=max_days, ref_date=ref_date)
-            if records:
+            if records and _kline_rows_sufficient(records, max_days):
                 result["sector_kline_60d"] = records
                 logger.info("行业板块 K 线: %s (%s, %s) → %d 条", board_name, board_code, level_tag, len(records))
                 break
+            if len(records) > len(best_short_sector_records):
+                best_short_sector_records = records
+                best_short_sector_name = board_name
 
         # Pass 1.5: push2 全失败后，映射到东财可交易官方行业板块再试一次
         if not result["sector_kline_60d"]:
             mapped_code, mapped_name = _remap_to_official_board(company_profile)
             if mapped_code:
                 mapped_records = _fetch_kline_by_secid(f"90.{mapped_code}", days=max_days, ref_date=ref_date)
-                if mapped_records:
+                if mapped_records and _kline_rows_sufficient(mapped_records, max_days):
                     result["sector_kline_60d"] = mapped_records
                     result["sector_name"] = mapped_name
                     logger.info("行业板块 K 线(官方映射): %s (%s) → %d 条", mapped_name, mapped_code, len(mapped_records))
+                elif len(mapped_records) > len(best_short_sector_records):
+                    best_short_sector_records = mapped_records
+                    best_short_sector_name = mapped_name
 
         # Pass 2: push2 全部失败后，再按层级尝试 akshare 板块K线
         if not result["sector_kline_60d"]:
             for board_code, board_name, level_tag in normalized_candidates:
                 logger.info("行业板块 push2 失败，尝试 akshare 板块K线: %s (%s)", board_name, level_tag)
                 records = _fetch_sector_kline_akshare(board_name, ak_module, max_days, ref_date)
-                if records:
+                if records and _kline_rows_sufficient(records, max_days):
                     result["sector_kline_60d"] = records
                     result["sector_name"] = board_name
                     logger.info("行业板块 K 线(akshare): %s (%s) → %d 条", board_name, level_tag, len(records))
                     break
+                if len(records) > len(best_short_sector_records):
+                    best_short_sector_records = records
+                    best_short_sector_name = board_name
 
         # Pass 3: 东财官方源都失败后，使用通达信本地行业指数（官方通达信体系）
         if not result["sector_kline_60d"]:
             tdx_records, tdx_name = _fetch_tdx_sector_kline_by_stock(symbol=symbol, days=max_days, ref_date=ref_date)
-            if tdx_records:
+            if tdx_records and _kline_rows_sufficient(tdx_records, max_days):
                 result["sector_kline_60d"] = tdx_records
                 result["sector_name"] = tdx_name or result.get("sector_name", "")
                 logger.info("行业板块 K 线(通达信本地): %s → %d 条", result["sector_name"], len(tdx_records))
+            elif len(tdx_records) > len(best_short_sector_records):
+                best_short_sector_records = tdx_records
+                best_short_sector_name = tdx_name or result.get("sector_name", "")
+
+        # Pass 4: 仅在前述官方/本地源都失败时，使用板块全量成分股合成
+        if not result["sector_kline_60d"]:
+            synth_candidates: list[tuple[str, str]] = []
+            for board_code, board_name, _ in normalized_candidates:
+                key = (board_code, board_name)
+                if board_code and key not in synth_candidates:
+                    synth_candidates.append(key)
+            mapped_code, mapped_name = _remap_to_official_board(company_profile)
+            if mapped_code and (mapped_code, mapped_name) not in synth_candidates:
+                synth_candidates.append((mapped_code, mapped_name))
+
+            for synth_code, synth_name in synth_candidates:
+                synth_records, synth_stats = _synthesize_sector_kline_from_all_constituents(
+                    board_code=synth_code,
+                    board_name=synth_name,
+                    ak_module=ak_module,
+                    ref_date=ref_date,
+                    max_days=max_days,
+                )
+                if synth_records and _kline_rows_sufficient(synth_records, max_days):
+                    result["sector_kline_60d"] = synth_records
+                    result["sector_name"] = synth_name
+                    logger.info(
+                        "行业板块 K 线(全成分合成): %s → %d 条, 成分股=%d, 有效K线=%d",
+                        synth_name,
+                        len(synth_records),
+                        synth_stats.get("total", 0),
+                        synth_stats.get("hist_ok", 0),
+                    )
+                    break
+                if len(synth_records) > len(best_short_sector_records):
+                    best_short_sector_records = synth_records
+                    best_short_sector_name = synth_name
+
+        if (not result["sector_kline_60d"]) and best_short_sector_records:
+            result["sector_kline_60d"] = best_short_sector_records
+            result["sector_name"] = best_short_sector_name or result.get("sector_name", "")
+            logger.info("行业板块 K 线使用最优短序列回退: %s → %d 条", result["sector_name"], len(best_short_sector_records))
 
         if not result["sector_kline_60d"]:
             logger.warning("行业板块 K 线所有官方源均失败(东财+通达信): %s", normalized_candidates)
