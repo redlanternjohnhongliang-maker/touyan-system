@@ -41,6 +41,9 @@ quant_archive/
 # === 数据目录（包含 CSV 缓存和 DB）===
 data/
 
+# === 二进制文档（Space 不接受直接推送）===
+*.pdf
+
 # === 其他 ===
 PROJECT_MEMORY.md
 *.bat
